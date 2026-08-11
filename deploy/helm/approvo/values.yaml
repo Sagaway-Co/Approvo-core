@@ -2,7 +2,7 @@
 ## Full docs: https://github.com/Sagaway-Co/Approvo-core/tree/main/docs
 
 image:
-  repository: ghcr.io/sagaway-co/approvo
+  repository: ghcr.io/sagaway-co/approvo-core
   tag: ""                       # 空则用 Chart.appVersion
   pullPolicy: IfNotPresent
   pullSecrets: []
