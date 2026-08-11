@@ -1,0 +1,11 @@
+apiVersion: v2
+name: approvo
+description: Feishu-based release approval gate for CI/CD pipelines
+type: application
+version: 0.1.0
+appVersion: "0.1.0-alpha"
+home: https://github.com/Sagaway-Co/Approvo-core
+sources:
+  - https://github.com/Sagaway-Co/Approvo-core
+maintainers:
+  - name: Sagaway

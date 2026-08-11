@@ -1,0 +1,72 @@
+{{- if ne (int .Values.replicaCount) 1 -}}
+{{- fail "SQLite backend requires replicaCount=1. Change store backend before increasing replicas." -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "approvo.fullname" . }}
+  labels:
+    {{- include "approvo.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}         # SQLite + 长连接单副本,不用滚动
+  selector:
+    matchLabels:
+      {{- include "approvo.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "approvo.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: approvo
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8700
+          envFrom:
+            - secretRef:
+                name: {{ include "approvo.secretName" . }}
+          env:
+            - {name: CONFIG_PATH, value: /app/config.yaml}
+            - {name: DB_PATH, value: /data/release.db}
+          volumeMounts:
+            - {name: config, mountPath: /app/config.yaml, subPath: config.yaml}
+            - {name: data, mountPath: /data}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8700}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8700}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "approvo.fullname" . }}-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "approvo.fullname" . }}-data
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

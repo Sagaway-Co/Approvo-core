@@ -1,0 +1,83 @@
+# 放到业务仓 .github/workflows/ 下.打 tag 触发:构建镜像 → 请求 approvo 发起飞书审批.
+# approvo 审批通过后会自动触发受限发版仓的 deploy.yml (workflow_dispatch),业务仓无需持有部署凭证.
+#
+# 需在业务仓配置 2 个 secret:
+#   RELEASE_GATE_URL   - approvo 服务地址 (如 https://release.example.com,可走内网/隧道)
+#   RELEASE_GATE_TOKEN - 与 approvo 环境变量 RELEASE_TOKEN 一致的共享密钥
+name: release-request
+
+on:
+  push:
+    tags: ['v*']            # 按你的 tag 规则调整 (例:V*.*.*-pre 三态见 docs/patterns/multi-stage.md)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+      commit: ${{ steps.commit.outputs.short }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: commit
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # === 构建 + 推镜像 === (按你的技术栈换成对应 action / 命令)
+      - name: Log in to registry
+        run: echo "$REGISTRY_PASSWORD" | docker login -u "$REGISTRY_USER" --password-stdin "$REGISTRY_HOST"
+        env:
+          REGISTRY_HOST: ${{ vars.REGISTRY_HOST }}          # 例:harbor.example.com
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - id: push
+        run: |
+          IMAGE="${{ vars.REGISTRY_HOST }}/${{ vars.PROJECT }}/${{ github.event.repository.name }}:${{ github.ref_name }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  request-approval:
+    needs: build
+    runs-on: ubuntu-latest         # approvo 走内网就换 self-hosted 或加隧道
+    steps:
+      - name: Request approvo approval (fail-close)
+        env:
+          GATE_URL: ${{ secrets.RELEASE_GATE_URL }}
+          GATE_TOKEN: ${{ secrets.RELEASE_GATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 关键约束:如果 approvo 不可达,workflow 必须失败 (fail-close),
+          # 否则失去审批意义.绝不要加 || true.
+          #
+          # 🔴🔴 这两道检查是从一次真实事故里长出来的,请不要"简化"掉:
+          #   某次网关迁移后 GATE_URL 还是 http://,服务端 301 跳 https。
+          #   而 `curl -f` 只对 >=400 失败,3xx 一律返回 0 ——
+          #   于是【一整天所有 workflow 全绿,审批一次都没送达】。
+          #   "假的 fail-close" 比没有 fail-close 更危险:它让你相信关卡在生效。
+
+          # ① 必须 https:token 走 header,http 会在 301 之前的第一跳就把它明文发上网络
+          case "$GATE_URL" in
+            https://*) ;;
+            *) echo "::error::RELEASE_GATE_URL 必须是 https:// (当前=$GATE_URL)"; exit 1 ;;
+          esac
+
+          # ② 判据落在【HTTP 状态码】上,不能靠 curl 的退出码
+          RESP="$(mktemp)"
+          CODE="$(curl -sS -o "$RESP" -w '%{http_code}' -X POST "$GATE_URL/release" \
+            -H "X-Release-Token: $GATE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(cat <<EOF
+          {
+            "repo":         "${GITHUB_REPOSITORY##*/}",
+            "tag":          "${GITHUB_REF_NAME}",
+            "github_actor": "${{ github.actor }}",
+            "commit":       "${{ needs.build.outputs.commit }}"
+          }
+          EOF
+          )")"
+          case "$CODE" in
+            2*) echo "✅ 审批已提交 (HTTP $CODE)"; cat "$RESP" ;;
+            *)  echo "::error::审批提交失败 HTTP $CODE"; cat "$RESP"; rm -f "$RESP"; exit 1 ;;
+          esac
+          rm -f "$RESP"

@@ -1,0 +1,38 @@
+name: helm
+
+on:
+  pull_request:
+    paths: ['deploy/helm/**']
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  lint-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: helm lint
+        run: helm lint deploy/helm/approvo
+
+      - name: helm template (render check with default values)
+        run: helm template approvo deploy/helm/approvo | head -200
+
+      - name: helm package (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p dist
+          helm package deploy/helm/approvo -d dist
+          ls dist
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: helm-chart
+          path: dist/*.tgz
+          retention-days: 30

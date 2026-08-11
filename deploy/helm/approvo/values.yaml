@@ -1,0 +1,69 @@
+## approvo Helm chart values.
+## Full docs: https://github.com/Sagaway-Co/Approvo-core/tree/main/docs
+
+image:
+  repository: ghcr.io/sagaway-co/approvo
+  tag: ""                       # 空则用 Chart.appVersion
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+## 硬约束:SQLite 单副本 - 改这个会被 chart 拒绝渲染
+replicaCount: 1
+
+## Secret 模式二选一:
+##   1) existingSecret != "" → 引用已存在的 secret (推荐生产用)
+##   2) existingSecret == "" 且 secrets.* 有值 → chart 自建 secret (demo 用)
+existingSecret: ""
+secrets:
+  FEISHU_APP_ID: ""
+  FEISHU_APP_SECRET: ""
+  LARK_ENDPOINT: "feishu"       # feishu(国内, open.feishu.cn) / lark(海外, open.larksuite.com) / 或完整 URL
+  RELEASE_TOKEN: ""             # /release 接口的共享密钥;留空=不校验
+  ADMIN_USER: "admin"
+  ADMIN_PASSWORD: ""            # 留空=/admin 禁用 (安全默认)
+  GITHUB_APP_ID: ""
+  GITHUB_APP_OWNER: ""          # 缺失会让 approvo 抛 KeyError (无 fallback,防误接前公司组织)
+  GITHUB_APP_PRIVATE_KEY: ""    # PEM 全文,多行,helm --set-file 传
+
+## ConfigMap 内容 (推荐用 --set-file config=/path/to/config.yaml 覆盖)
+config:
+  feishu:
+    approval_code: "<YOUR_APPROVAL_CODE>"
+    notify_chat_id: "oc_<your_chat_id>"
+    default_initiator_user_id: "<user_id>"
+  releases:
+    demo:
+      method: dryrun
+      image_repo: "registry.example.com/your-org/demo"
+
+persistence:
+  size: 1Gi
+  storageClass: local-path       # 单节点用 local-path;多节点+HA 需 RWO 网络存储
+
+service:
+  port: 8700
+
+ingress:
+  enabled: true
+  className: nginx               # 按你的集群 Ingress controller 调整
+  ## 公网入口 - 建议只暴露 /release + /healthz (结构性隔离)
+  public:
+    enabled: true
+    host: release.example.com
+    tls: []                       # [{secretName: ..., hosts: [...]}]
+  ## 内网管理入口 - 暴露全部 (含 /admin);仅内网 DNS
+  admin:
+    enabled: true
+    host: release-admin.example.internal
+    tls: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,99 @@
+# approvo · 示例配置
+# 复制成 config.yaml 后按需修改。密钥走环境变量,不要写在这里(见 docs/CONFIGURATION.md)。
+# 飞书(国内)用户可跳过 LARK_ENDPOINT (默认 feishu);Lark(海外)用户需 export LARK_ENDPOINT=lark。
+
+# 项目名前缀 (可选) - 显示在所有卡片标题最前面,方便多项目审批时一眼分辨.
+# 顶层默认,可被 release.project 或 POST /release body.project 覆盖.
+default_project: "MyProject"    # 比如 QHSE-UMP / MY-PROJECT 等
+
+feishu:
+  # 审批定义(二选一,至少一个):
+  # (A) 单定义 - 简单场景,所有 stage 走同一个审批
+  approval_code: "<YOUR_APPROVAL_CODE>"        # 用 scripts/create_approval.py 生成,或飞书/Lark 审批后台拿到
+  # (B) 按 stage 分派 - 推荐生产:不同 stage 不同审批人组合
+  # approval_codes:
+  #   pre:     "<QA_CODE>"         # QA 发版(动态群成员或签)
+  #   release: "<PROD_CODE>"       # 生产(固定 CEO/技术负责人),卡片自动 ⚠️ 围栏 + 红色 header
+  #   hotfix:  "<HOTFIX_CODE>"     # 紧急(可能会签多人)
+  #   default: "<FALLBACK_CODE>"   # 未匹配 stage 时兜底(可省)
+  notify_chat_id: "oc_<your_notify_chat_id>"   # 结果卡发到的群 chat_id;机器人需在群里
+  default_initiator_user_id: "<user_id>"       # 兜底申请人(邮箱/GitHub actor 都解析不出时用)
+  # GitHub 用户名 -> 飞书/Lark user_id (卡片申请人两行显示:第一行真名+第二行 github)
+  user_map:
+    # 老格式 (向后兼容, name 为空则第二行退化为"github(未映射)")
+    alice: "<user_id>"
+    # 新格式 (推荐, 卡片显示真名 · github 双行)
+    bob:
+      user_id: "<user_id>"
+      name: "Bob"
+  # 仅当你用飞书审批后台 UI 手搓审批定义、控件 id 是 GUID 时才需要;
+  # 用 scripts/create_approval.py 建的定义不用配(id 就是逻辑名)。
+  # form_field_ids:
+  #   repo: "widget16xxxxxxx"
+  #   tag:  "widget16yyyyyyy"
+
+clusters:                                     # 供 method=kubectl / helm 使用;method=github 不需要
+  primary:
+    kubeconfig: "/secrets/kubeconfig-primary"  # 容器内挂载路径
+    context: "primary"                         # kubeconfig 里的 context 名
+
+# 只读凭证自助面板(POST /viewer-panel 往审批群发一张常驻卡,点按钮即签发)。
+# 目的:让"查日志"不必 ssh。API 形态要求人拿共享 token + 记住自己的 user_id + 会 curl,
+# 大部分人会觉得 ssh 更快 —— 通道存在 ≠ 人会用,所以要压成"点一下"。
+viewer_targets:
+  - label: "🔍 生产只读 30 分钟"
+    cluster: "prod-cluster"
+    namespace: "prod-namespace"
+    minutes: 30
+    prod: true                                 # 生产按钮渲染成红色,点之前看得见
+  - label: "🔍 QA 只读 30 分钟"
+    cluster: "qa"
+    namespace: "qa-namespace"
+    minutes: 30
+
+# 每个 release 的 method 决定部署路径:
+#   github  - 触发受限发版仓库的 workflow_dispatch (推荐,凭证隔离)
+#   kubectl - approvo 直接 kubectl set image + rollout status
+#   helm    - approvo 直接 helm upgrade --reuse-values
+#   dryrun  - 不连集群、不触发 GitHub;跑通"申请→审批→结果卡片"整条链路,联调用
+#
+# 可选字段 stage 支持发版阶段区分(pre/release/hotfix 或自定义),会展示在审批卡片并透传给 deploy workflow
+releases:
+
+  # 示例 1: dryrun,联调用
+  demo:
+    method: dryrun
+    project: "MyProject-CI"     # 可选,覆盖顶层 default_project
+    image_repo: "registry.example.com/your-org/demo"
+
+  # 示例 2: kubectl(无 chart,最稳)
+  api:
+    method: kubectl
+    cluster: primary
+    namespace: default
+    deployment: api                            # kubectl set image deployment/api
+    container: api                             # 容器名(注意 container != deployment 名的情况)
+    image_repo: "registry.example.com/your-org/api"
+
+  # 示例 3: helm upgrade
+  web:
+    method: helm
+    cluster: primary
+    namespace: default
+    helm_release: web
+    chart: "/charts/web"                       # 容器内可访问的 chart 路径或仓库 ref
+    image_key: "image.tag"                     # --set image.tag=<tag>
+    image_repo: "registry.example.com/your-org/web"
+
+  # 示例 4: 触发受限发版仓库的 workflow (推荐,开发碰不到部署凭证)
+  worker:
+    method: github
+    source_repo: worker                        # 拉变更清单的仓库(可选,不配则跳过).只写仓库名,owner 从 GITHUB_APP_OWNER 拿.兼容旧写法 'your-org/worker' (代码会 split)
+    image_repo: "registry.example.com/your-org/worker"
+    github:
+      owner: your-org                          # GitHub 组织
+      repo: release-deploy                     # 【受限发版仓库】,所有 release 共用一个
+      workflow: deploy.yml                     # 受限仓库里的部署 workflow (on: workflow_dispatch)
+      ref: main
+      env: prod
+      # inputs:                                # 可选,追加额外 workflow inputs

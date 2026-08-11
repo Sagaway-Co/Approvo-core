@@ -1,0 +1,24 @@
+approvo has been installed.
+
+Service:  {{ include "approvo.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+{{- if .Values.ingress.enabled }}
+
+Ingress:
+{{- if .Values.ingress.public.enabled }}
+  * public (只暴露 /release + /healthz):  https://{{ .Values.ingress.public.host }}
+{{- end }}
+{{- if .Values.ingress.admin.enabled }}
+  * admin  (暴露全部, 请配内网 DNS):     https://{{ .Values.ingress.admin.host }}
+{{- end }}
+{{- end }}
+
+Quick check:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "approvo.fullname" . }} 8700:{{ .Values.service.port }}
+  curl -s http://localhost:8700/healthz | jq
+
+Next steps:
+  1. 在飞书自建应用后台配置事件订阅 (approval_instance) + 权限 scopes
+  2. 用 scripts/create_approval.py 生成审批定义,拿到 approval_code
+  3. 用 helm upgrade --set-file config=config.yaml 更新 releases 清单
+  4. 在业务仓的 .github/workflows/release.yml 里 curl POST /release

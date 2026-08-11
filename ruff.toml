@@ -1,0 +1,16 @@
+# ruff.toml —— approvo lint 配置。
+#
+# 采用 ruff 默认规则集，但对既有代码里【故意为之/框架惯例/低风险】的少数规则放行，
+# 避免为纯风格问题改动运行中的业务逻辑（时间语义、异常捕获等）。新代码仍受其余规则约束。
+# 如需收紧，逐条从 ignore 移除并配套修复即可。
+line-length = 100
+
+[lint]
+ignore = [
+    "DTZ005",  # datetime.now() 未带 tz —— store 里用本地时间是既有约定，改动涉及时间语义
+    "BLE001",  # except Exception 宽捕获 —— poller/事件循环里有意兜底，防单条失败打挂进程
+    "S110",    # try-except-pass —— 非关键路径的有意吞错（已在上层记录/无副作用）
+    "PLW1510", # subprocess.run 未显式 check= —— deployer 自行判定返回码
+    "PIE810",  # 多个 startswith 可合并 —— 可读性权衡，保留现状
+    "B008",    # 函数调用作默认参数 —— FastAPI Depends() 的标准写法（误报）
+]

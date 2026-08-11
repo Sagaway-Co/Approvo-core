@@ -1,0 +1,74 @@
+name: notify-failure
+
+# 监听本仓所有 workflow 完成事件, 只在 conclusion=failure 时向 Lark 群机器人发通知.
+# workflow_run 触发的 workflow 必须在 default branch (main) 上才生效, PR 里改动无法自测.
+# Secrets 来源: Sagaway-Co org level (visibility=all), 见 sagaway-pr-workflow.
+
+on:
+  workflow_run:
+    workflows: [ci, docker, helm, release]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  notify:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Lark card
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          LARK_WEBHOOK_SECRET: ${{ secrets.LARK_WEBHOOK_SECRET }}
+          REPO: ${{ github.event.workflow_run.repository.full_name }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          URL: ${{ github.event.workflow_run.html_url }}
+          MSG: ${{ github.event.workflow_run.display_title }}
+        run: |
+          set -euo pipefail
+          TS=$(date +%s)
+          # Lark 签名: base64( HMAC_SHA256(key=timestamp+"\n"+secret, msg=empty) )
+          KEY=$(printf "%s\n%s" "$TS" "$LARK_WEBHOOK_SECRET")
+          SIGN=$(printf "" | openssl dgst -sha256 -hmac "$KEY" -binary | base64)
+          SHORT_SHA=${SHA:0:7}
+          PAYLOAD=$(jq -n \
+            --arg ts "$TS" --arg sign "$SIGN" \
+            --arg repo "$REPO" --arg wf "$WF_NAME" \
+            --arg branch "$BRANCH" --arg actor "$ACTOR" \
+            --arg sha "$SHORT_SHA" --arg url "$URL" --arg msg "$MSG" '
+          {
+            timestamp: $ts,
+            sign: $sign,
+            msg_type: "interactive",
+            card: {
+              config: {wide_screen_mode: true},
+              header: {template: "red", title: {tag: "plain_text", content: "❌ GitHub Actions 失败"}},
+              elements: [
+                {tag: "div", fields: [
+                  {is_short: true, text: {tag: "lark_md", content: ("**仓库**\n" + $repo)}},
+                  {is_short: true, text: {tag: "lark_md", content: ("**Workflow**\n" + $wf)}},
+                  {is_short: true, text: {tag: "lark_md", content: ("**分支**\n" + $branch)}},
+                  {is_short: true, text: {tag: "lark_md", content: ("**触发人**\n" + $actor)}},
+                  {is_short: true, text: {tag: "lark_md", content: ("**提交**\n`" + $sha + "`")}},
+                  {is_short: true, text: {tag: "lark_md", content: ("**触发信息**\n" + $msg)}}
+                ]},
+                {tag: "action", actions: [
+                  {tag: "button", text: {tag: "plain_text", content: "查看日志"}, type: "primary",
+                   url: $url}
+                ]}
+              ]
+            }
+          }')
+          # 判据落在 HTTP 状态码上:curl -f 对 3xx 返回 0,会让"通知没送到"看起来像成功 ——
+          # 而【静默失败的告警等于没有告警】。通知器本身不该让流水线失败,故只告警不 exit 1。
+          CODE="$(curl -sS -o /tmp/notify.out -w '%{http_code}' -X POST "$LARK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" -d "$PAYLOAD")"
+          case "$CODE" in
+            2*) echo "通知已送达 (HTTP $CODE)" ;;
+            *)  echo "::warning::失败通知没送出去 (HTTP $CODE)"; cat /tmp/notify.out ;;
+          esac

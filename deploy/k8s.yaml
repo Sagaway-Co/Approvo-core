@@ -1,0 +1,118 @@
+# approvo · Kubernetes 部署清单(all-in-one, 无需 helm)
+#
+# 部署模型:
+# - approvo 走 GitHub workflow_dispatch 触发受限发版仓库的 deploy.yml;本身不持 kubeconfig,只持 GITHUB_APP token
+# - 事件走飞书长连接(出方向即可),无需入站公网
+# - /release 由公网入口反代进来(建议只放 /release 和 /healthz)
+# - /admin 只走内网 Ingress,结构性隔离
+#
+# 需要 helm 部署请见 deploy/helm/approvo/
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: approvo
+# Secret 不放本文件(避免真密钥进 git)。命令式创建:
+#   kubectl -n approvo create secret generic approvo-secret \
+#     --from-literal=FEISHU_APP_ID=... --from-literal=FEISHU_APP_SECRET=... \
+#     --from-literal=RELEASE_TOKEN=... --from-literal=ADMIN_USER=admin \
+#     --from-literal=ADMIN_PASSWORD=... \
+#     --from-literal=GITHUB_APP_ID=... --from-literal=GITHUB_APP_OWNER=your-org \
+#     --from-file=GITHUB_APP_PRIVATE_KEY=./app-private-key.pem
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: approvo-config
+  namespace: approvo
+data:
+  config.yaml: |
+    # 示例 minimal 配置,生产请覆盖为你自己的 releases 清单(见 config.example.yaml 与 docs/CONFIGURATION.md)
+    feishu:
+      approval_code: "<YOUR_APPROVAL_CODE>"
+      notify_chat_id: "oc_<your_notify_chat_id>"
+      default_initiator_user_id: "<user_id>"
+    releases:
+      demo:
+        method: dryrun
+        image_repo: "registry.example.com/your-org/demo"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: approvo-data
+  namespace: approvo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: approvo
+  namespace: approvo
+spec:
+  replicas: 1                 # 长连接 + SQLite,单副本(多副本会重复消费事件、重复部署)
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: approvo}}
+  template:
+    metadata: {labels: {app: approvo}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001}
+      containers:
+        - name: approvo
+          image: approvo:local        # 生产改成你自己的 registry 地址
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8700}]
+          envFrom: [{secretRef: {name: approvo-secret}}]
+          env:
+            - {name: CONFIG_PATH, value: /app/config.yaml}
+            - {name: DB_PATH, value: /data/release.db}
+          volumeMounts:
+            - {name: config, mountPath: /app/config.yaml, subPath: config.yaml}
+            - {name: data, mountPath: /data}
+          readinessProbe: {httpGet: {path: /healthz, port: 8700}, initialDelaySeconds: 5}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {memory: 384Mi}}
+      volumes:
+        - {name: config, configMap: {name: approvo-config}}
+        - {name: data, persistentVolumeClaim: {claimName: approvo-data}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: approvo, namespace: approvo}
+spec:
+  selector: {app: approvo}
+  ports: [{port: 8700, targetPort: 8700}]
+---
+# 公网入口:建议只暴露 /release 和 /healthz。/admin 和 /api/* 在这条路径上没有路由 →
+# 公网够不到,结构性隔离(不依赖认证,依赖路由)。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: approvo-public
+  namespace: approvo
+spec:
+  ingressClassName: nginx            # 按你的 Ingress controller 改,例如 nginx / higress / traefik
+  rules:
+    - host: release.example.com      # 改成你的公网域名
+      http:
+        paths:
+          - {path: /release, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
+          - {path: /healthz, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
+---
+# 内网管理入口:/admin 全功能走这里,只在办公网 DNS 解析,绝不挂公网
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: approvo-admin
+  namespace: approvo
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: release-admin.example.internal   # 仅内网 DNS,指向集群入口 IP
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
+# NetworkPolicy 待跑通后单独加。注意:严格的"只放 Ingress 入站"会挡掉 kubelet 健康探针,
+# 需同时放行节点 IP,验证后再上。

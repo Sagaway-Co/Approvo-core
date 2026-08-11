@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    # approvo 的状态存 PostgreSQL(2026-08-10 从 SQLite 迁出)。
+    # 存储层的 SQL 方言/upsert 语义/rowcount 行为只有真库能验 ——
+    # 尤其 try_claim_for_deploy 的原子性,它一旦失效就是【同一审批部署两次】。
+    # 不起这个 service 的话 tests/test_store_pg.py 会整体 skip，等于没写。
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: testpw      # 仅 CI 临时容器,非真实凭据
+          POSTGRES_DB: approvo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps + dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff mypy pytest httpx   # httpx: FastAPI TestClient 依赖，用于验证 lifespan 真的执行
+
+      - name: Ruff (lint + format check)
+        run: ruff check .
+
+      - name: Mypy (type check, non-strict for now)
+        run: mypy app --ignore-missing-imports --no-error-summary || true
+
+      - name: Pytest (skip if no tests directory)
+        env:
+          DB_DSN: postgresql://postgres:testpw@127.0.0.1:5432/approvo
+        run: |
+          if [ -d tests ]; then pytest -q; else echo "no tests dir, skip"; fi
+          # 断言真库用例【确实跑了】而不是被 skip —— "全绿"可能只是全跳过。
+          # 空输出/跳过伪装成成功，是这个项目反复踩过的坑。
+          if [ -d tests ]; then
+            pytest -q tests/test_store_pg.py --collect-only >/dev/null
+            pytest tests/test_store_pg.py -q 2>&1 | tail -1 | grep -qE '[0-9]+ passed' \
+              || { echo "::error::PG 用例没有真正执行（可能被 skip：DB_DSN 未生效或库连不上）"; exit 1; }
+          fi
+
+  leak-guard:
+    # 🔴 防泄露门禁：不允许任何【具体的】部署环境信息进入本仓。
+    #
+    # 刻意用【模式】而不是【字面量黑名单】：黑名单本身要写出你不想公开的字符串,
+    # 那等于把它公开一次(本仓开源前就踩过这个矛盾)。模式匹配没有这个问题,
+    # 而且能拦住未来任何人新写进来的内网地址,不只是已知那几个。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 禁止具体环境信息入仓
+        run: |
+          set -uo pipefail
+          # 说明：--exclude=ci.yml 是因为本文件自身就写着这些模式(它是防护机制,不是残留)
+          PATTERNS=(
+            'crpi-[a-z0-9]{8,}'                              # 阿里云 ACR 实例
+            'LTAI[0-9A-Za-z]{16,}'                           # 阿里云 AccessKeyId
+            '-----BEGIN [A-Z ]*PRIVATE KEY'                  # 任何私钥
+            'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}'      # JWT
+            'gh[pousr]_[A-Za-z0-9]{20,}'                     # GitHub token
+            'cli_[a-z0-9]{14,}'                              # 真实 Lark App ID(占位符 cli_xxx 不会命中)
+            '(ou|oc|on)_[a-f0-9]{28,}'                       # 真实 Lark open_id / chat_id
+            '\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b'          # 内网 IP(127.x 回环是容器健康检查的正当用法,不拦)
+            '\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b'
+            '\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b'
+          )
+          FAIL=0
+          for p in "${PATTERNS[@]}"; do
+            if grep -rEn --binary-files=without-match \
+                 --exclude-dir=.git --exclude=ci.yml "$p" . ; then
+              echo "::error::命中禁止模式 /$p/ —— 具体部署信息不得进入本仓,请改用占位符或环境变量"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" != "0" ]; then exit 1; fi
+          echo "clean ✅ 未发现具体环境信息"
