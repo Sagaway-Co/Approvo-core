@@ -1,4 +1,14 @@
 # Contributing to approvo
+> ## 🚨 本仓库对公众开放
+>
+> 提交任何内容前，请确认不含：**凭据**（口令/token/AccessKey/证书/私钥/kubeconfig）、
+> **网络与拓扑**（内网 IP/内网域名/集群名/namespace/镜像仓库实例地址）、
+> **身份**（真实人名/手机号/IM 平台的 app_id·app_secret·open_id·chat_id）、
+> **组织信息**（客户名/内部仓库名/内部服务清单）。
+>
+> 举例请用中性占位符（`my-app` / `registry.example.com` / `https://approvo.example.com`）。
+> CI 的 `leak-guard` 会做模式匹配兜底，但**它拦不住语义上的敏感信息** —— 那部分靠人。
+> 详见 [CLAUDE.md](CLAUDE.md)（同样适用于人类）。
 
 感谢关注 approvo!本项目脱胎于生产在用的内部工具,现在开源;欢迎 PR、Issue、想法.
 
