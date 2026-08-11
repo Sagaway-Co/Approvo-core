@@ -27,7 +27,13 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/approvo
+          # 🔴 必须用 github.repository（= 本仓名），不要写死 "approvo"：
+          #    org 下已存在一个同名 GHCR 包 approvo,它归【内部私有仓】所有(105 个内部生产镜像版本)。
+          #    写死名字会让本【公开】仓的 CI 去推内部私有仓的镜像包 ——
+          #    公开与内部的供应链就混进同一个包里了。首次推送被权限拒绝才没出事,
+          #    也就是说这里当初是靠"恰好没权限"兜住的,不是设计对了。
+          #    metadata-action 会自动把大写归一化成小写,故 Sagaway-Co/Approvo-core → sagaway-co/approvo-core。
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
