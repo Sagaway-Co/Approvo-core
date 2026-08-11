@@ -62,7 +62,8 @@ spec:
       securityContext: {runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001}
       containers:
         - name: approvo
-          image: approvo:local        # 生产改成你自己的 registry 地址
+          # 自行构建后填你自己的 registry 地址（裸名会落到 docker.io/library/*，那不是本项目）
+          image: your-registry.example.com/approvo:0.1.0
           imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8700}]
           envFrom: [{secretRef: {name: approvo-secret}}]

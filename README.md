@@ -48,7 +48,7 @@ approvo 的取舍:
 ## 3 分钟跑通 dryrun
 
 ```bash
-git clone https://github.com/Sagaway-Co/Approvo-core && cd approvo
+git clone https://github.com/Sagaway-Co/Approvo-core && cd Approvo-core
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -67,6 +67,24 @@ flush 后你会看到审批群里出现"🚀 发版申请·待审批"卡片,通�
 
 完整上手 (含飞书应用申请、审批定义、helm 部署) 见 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
+## 自行构建镜像
+
+本项目**不发布公开镜像**。请自行构建并推到你自己的 registry：
+
+```bash
+docker build -f deploy/Dockerfile -t your-registry.example.com/approvo:0.1.0 .
+docker push your-registry.example.com/approvo:0.1.0
+```
+
+然后在 Helm 里覆盖镜像地址（`values.yaml` 的默认值是一个**故意不存在**的占位符，
+这样配错时会立刻 ImagePullBackOff，而不是悄悄拉到某个同名的陌生镜像）：
+
+```bash
+--set image.repository=your-registry.example.com/approvo --set image.tag=0.1.0
+```
+
+CI 里的 `docker (build only)` 会持续验证 `deploy/Dockerfile` 可构建。
+
 ## 生产部署 (Helm)
 
 ```bash
@@ -82,12 +100,13 @@ Chart 提供 configmap / secret / pvc / deployment / service / ingress (public +
 
 ### 环境特化 values (⚠️ 关键 pattern)
 
-不同集群 (QA / prod / ...) 的 ingress host、releases 清单等在 [deploy/environments/](deploy/environments/) 下按环境放一个 values 文件.更新走这**唯一**一条命令:
+不同集群 (QA / prod / ...) 的 ingress host、releases 清单等，建议各自放一个 values 文件
+(例如 `deploy/environments/<env>.yaml`，**本仓不附带任何真实环境的 values**).更新走这**唯一**一条命令:
 
 ```bash
 helm upgrade approvo ./deploy/helm/approvo \
   --namespace approvo --reuse-values \
-  -f deploy/environments/qa.yaml
+  -f deploy/environments/<env>.yaml
 ```
 
 **必须同时用 `--reuse-values` 和 `-f <env>.yaml`**:

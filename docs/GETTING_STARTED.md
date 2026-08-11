@@ -95,6 +95,10 @@ curl -X POST localhost:8700/release \
 
 ### 方式 A: Helm (推荐)
 
+> ⚠️ 本项目不发布公开镜像，先自行构建并推到你自己的 registry：
+> `docker build -f deploy/Dockerfile -t <your-registry>/approvo:0.1.0 . && docker push <your-registry>/approvo:0.1.0`
+> 然后在下面的 `helm install` 里加 `--set image.repository=<your-registry>/approvo --set image.tag=0.1.0`。
+
 ```bash
 # 建 secret (需要真实凭证)
 kubectl create namespace approvo
