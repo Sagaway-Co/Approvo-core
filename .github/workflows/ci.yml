@@ -93,3 +93,5 @@ jobs:
           done
           if [ "$FAIL" != "0" ]; then exit 1; fi
           echo "clean ✅ 未发现具体环境信息"
+
+# 自测：本行由 guard 自测 PR 添加，用于验证 CI 配置改动会被拦下
