@@ -2,13 +2,9 @@
 ## Full docs: https://github.com/Sagaway-Co/Approvo-core/tree/main/docs
 
 image:
-  # 🔴 本项目【不发布公开镜像】，请自行构建并推到你自己的 registry，然后覆盖本值。
-  #    刻意用一个明显不存在的占位符，让配错时立刻 ImagePullBackOff、一眼看出原因。
-  #    不要改成裸名 "approvo"：它会解析成 docker.io/library/approvo
-  #    （Docker 官方镜像命名空间，本项目不在其中），报错是含糊的 "not found"。
-  #    也不要默认指向任何【我们并不拥有的】带命名空间的名字（如 someorg/approvo）
-  #    —— 那种名字是可以被他人注册的，等于把镜像来源交给陌生人。
-  repository: your-registry.example.com/approvo
+  # 官方镜像：https://hub.docker.com/r/sagawayco/approvo-core
+  #    请始终写【完整地址】：裸名 "approvo" 会落到 docker.io/library/*（Docker 官方镜像命名空间）。
+  repository: docker.io/sagawayco/approvo-core
   tag: ""                       # 空则用 Chart.appVersion
   pullPolicy: IfNotPresent
   pullSecrets: []

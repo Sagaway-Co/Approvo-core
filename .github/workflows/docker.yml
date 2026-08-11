@@ -1,4 +1,4 @@
-name: docker (build only)
+name: docker
 
 on:
   push:
@@ -6,9 +6,12 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
-# 🔴 只构建、不推送：本项目不发布公开镜像（org 策略不允许把包设为 public，
-#    而推一个拉不到的私有包只会误导使用者）。这里的价值是【持续证明 Dockerfile 能构建】。
-#    需要镜像请自行构建并推到你自己的 registry，见 README「自行构建镜像」。
+# 镜像发布到 Docker Hub 的 sagawayco/approvo-core（GHCR 走不通:org 策略不允许公开包）。
+#
+# 🔴 第三方 action 一律钉到 commit SHA,不用 @v3 这类可变 tag:
+#    本 workflow 持有 registry 的可写凭据,而可变 tag 指向的代码随时可能被换掉。
+# 🔴 触发器刻意只有 push(main/tag) 与手动:绝不用 pull_request_target / workflow_run,
+#    那两个会让 fork 的 PR 在【带 secret】的上下文里跑。
 permissions:
   contents: read
 
@@ -16,20 +19,22 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
-          # 🔴 必须用 github.repository（= 本仓名），不要写死 "approvo"：
-          #    org 下已存在一个同名 GHCR 包 approvo,它归【内部私有仓】所有(105 个内部生产镜像版本)。
-          #    写死名字会让本【公开】仓的 CI 去推内部私有仓的镜像包 ——
-          #    公开与内部的供应链就混进同一个包里了。首次推送被权限拒绝才没出事,
-          #    也就是说这里当初是靠"恰好没权限"兜住的,不是设计对了。
-          #    metadata-action 会自动把大写归一化成小写,故 Sagaway-Co/Approvo-core → sagaway-co/approvo-core。
-          images: ghcr.io/${{ github.repository }}
+          # 🔴 这里【必须写死】,因为 registry 命名空间(sagawayco)与 GitHub owner(Sagaway-Co)不同名。
+          #    与之前那个 bug 的区别:那次是写死成【别的仓的包名】导致跨仓污染,
+          #    这次是刻意的跨 registry 映射。改这一行时,README 里的 docker pull 也要同步改。
+          images: docker.io/sagawayco/approvo-core
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -38,11 +43,11 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: .
           file: deploy/Dockerfile
-          push: false
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
