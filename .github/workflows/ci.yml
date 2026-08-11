@@ -84,6 +84,20 @@ jobs:
             '\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b'
           )
           FAIL=0
+
+          # 🔴🔴 铁律：交接 / 事故复盘 / 里程碑 / 内部说明文档，绝不得进入本仓（公开仓）。
+          #    这类文档天生含事故细节、集群拓扑、客户名、真实人名与凭据处置过程,
+          #    是信息密度最高的泄露源,且【不存在"脱敏后放进去"这个选项】——
+          #    它的价值恰恰来自那些具体细节。要给外部读者看的内容请另写(README / docs/),从零写。
+          #    ⚠️ 本检查只按【文件名】拦；把内容粘进别的文件它拦不住,那仍然靠人。
+          if find . -path ./.git -prune -o \
+               \( -iname 'HANDOFF*' -o -iname '*交接*' -o -iname 'MILESTONE*' -o -iname '里程碑*' \) \
+               -print | grep -q . ; then
+            echo "::error::发现交接/内部文档类文件 —— 绝不得进入公开仓"
+            find . -path ./.git -prune -o \( -iname 'HANDOFF*' -o -iname '*交接*' -o -iname 'MILESTONE*' -o -iname '里程碑*' \) -print
+            FAIL=1
+          fi
+
           for p in "${PATTERNS[@]}"; do
             if grep -rEn --binary-files=without-match \
                  --exclude-dir=.git --exclude=ci.yml "$p" . ; then
