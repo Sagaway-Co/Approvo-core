@@ -1,9 +1,17 @@
-lark-oapi>=1.4.0
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2.6
-pyyaml>=6.0
-requests>=2.31
-PyJWT[crypto]>=2.8.0
-psycopg[binary,pool]>=3.1
-tzdata>=2024.1
+# 🔴 版本一律钉死（==），不用 >=。
+#
+# 原因：本仓对外发布【别人会拉去跑】的镜像。用 >= 时同一个 commit 今天和下周
+# 构建出的镜像内容不同（不可复现），且上游任意一个包发布被投毒的新版本，
+# 下一次构建就直接进到用户拉的镜像里 —— 这条路【不经过任何 PR，审不到】。
+#
+# 下面的版本取自 2026-08-11 一次通过的 CI（实际装上并跑过测试的组合），
+# 不是手填的最新版。升级请单独开 PR，让 CI 跑过再合。
+lark-oapi==1.7.2
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+pydantic==2.13.4
+pyyaml==6.0.3
+requests==2.34.2
+PyJWT[crypto]==2.13.0
+psycopg[binary,pool]==3.3.4
+tzdata==2026.3
