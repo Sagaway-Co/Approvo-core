@@ -1,0 +1,3 @@
+# .github/ 下的任何改动都必须由维护者 review。
+# 与 guard.yml 是两道独立的门：guard 让这类 PR 直接变红，CODEOWNERS 保证它进不了"无人看"的状态。
+/.github/  @a20020307

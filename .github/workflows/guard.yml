@@ -1,0 +1,47 @@
+name: guard
+
+# 🔴 PR 不得修改 CI 配置。
+#
+# 为什么单独拦这一类：本仓是【公开仓】，而 org 级有多个 secret 对它可见。
+# 但 secret 不会自动进入 job 环境 —— 只有 workflow 里显式写了 ${{ secrets.X }} 才拿得到。
+# 所以【.github/workflows/** 是唯一能把 secret 映射出来的地方】，其它文件改不到它。
+# 盯死这一个目录，比泛泛地"深度审计所有 PR"有效得多。
+#
+# ⚠️ 本检查拦得住：忘了看 diff、或没意识到 PR 里夹了 CI 改动。
+# ⚠️ 拦不住：PR 把本文件本身改成永真（pull_request 事件跑的是 PR 版本的 workflow）。
+#    对此的兜底是把本 job 设为 required status check ——
+#    删掉/改名本 job 会导致该检查【永不上报】，从而卡住合并。
+#    剩下的"改成永真"只能靠看 diff，而那恰好就是 workflow 的 diff，是最好审的一种。
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  no-ci-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+      - name: 检查 PR 是否触碰 CI 配置
+        env:
+          # 🔴 攻击者可控的值一律走 env，绝不内联进 run: —— 那是命令注入通道
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE" 2>/dev/null || true
+          CHANGED="$(git diff --name-only "$BASE" "$HEAD")"
+          echo "本 PR 改动的文件："
+          echo "$CHANGED" | sed 's/^/  /'
+          # 判据落在匹配行数上，不靠管道退出码
+          HITS="$(printf '%s\n' "$CHANGED" | grep -cE '^\.github/(workflows|actions)/' || true)"
+          if [ "$HITS" != "0" ]; then
+            echo "::error::本 PR 修改了 $HITS 处 CI 配置（.github/workflows|actions）。这是唯一能把 secret 映射出来的地方，一律不接受。请把 CI 改动拆成独立 PR，由维护者单独处理。"
+            exit 1
+          fi
+          echo "✅ 未触碰 CI 配置"
