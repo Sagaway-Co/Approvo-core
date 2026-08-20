@@ -12,6 +12,8 @@ import time
 
 import requests
 
+from app import deploycred, k8s
+
 API = os.environ.get("GITHUB_API", "https://api.github.com")  # 自建/企业版改这里
 
 # 安装 token 缓存(GitHub App 方式,token ~1h 过期,提前续)
@@ -91,6 +93,29 @@ def _split_owner_repo(repo_spec: str, default_owner: str) -> tuple[str, str]:
     return default_owner, repo_spec
 
 
+class AppInstallLookupError(RuntimeError):
+    """拿不到某个仓的 App 安装信息(`/repos/{owner}/{repo}/installation` 返回 404)。
+
+    单独立一个类型,是为了让调用方能把它和"GitHub 挂了/网络不通"区分开:
+    前者是**配置错误**(该报 409,人去 App 安装设置里勾一下就好),
+    后者才是**校验服务不可用**(fail-close 报 502)。
+
+    ⚠️ **404 不等于"App 没装"**。实测过一种情况:App 确实装在该 org 上、
+    Repository access 也是 all,而 `/repos/{owner}/{repo}/installation` 仍然 404
+    (典型成因是 `GITHUB_APP_ID` 与私钥不属于同一个/仍存在的 App,JWT 认到了
+    另一个没装的 App)。所以错误信息必须把三种可能都列出来,
+    否则看到的人会去做一件已经做过的事。
+
+    为什么这类故障可以坏很久才暴露(这条比 404 本身更值得记):
+    **派发部署用的是 PAT / 安装 token,只有"读仓库"走 App 读路径。**
+    而读路径(拉变更清单)是被 try/except 吞掉的 —— 失败只表现为
+    "审批卡片上没有变更清单",没人会因此报警。直到
+    `check_release_promotes_pre`(fail-close,不吞异常)第一次执行,
+    它才以 502 的形式冒出来。
+    ⇒ 一条被 try/except 吞掉的依赖,可以坏很久而无人知晓。
+    """
+
+
 def _repo_read_token(repo: str) -> str:
     now = time.time()
     tk = _read_tokens.get(repo)
@@ -101,6 +126,18 @@ def _repo_read_token(repo: str) -> str:
     jh = {"Authorization": f"Bearer {_app_jwt()}", "Accept": "application/vnd.github+json"}
     owner, repo_only = _split_owner_repo(repo, os.environ["GITHUB_APP_OWNER"])
     r = requests.get(f"{API}/repos/{owner}/{repo_only}/installation", headers=jh, timeout=10)
+    if r.status_code == 404:
+        # 404 在这里的含义是"这个仓上读不到 App 安装信息"。给出可直接照做的指引,
+        # 而不是把 HTTPError 冒泡成"服务不可用"。
+        raise AppInstallLookupError(
+            f"读不到 {owner}/{repo_only} 的 App 安装信息(GitHub 返回 404)。"
+            f"按顺序查三件事:"
+            f"① App 是否装在 owner『{owner}』上、且 Repository access 覆盖 {repo_only};"
+            f"② GITHUB_APP_ID(当前 {os.environ.get('GITHUB_APP_ID', '未设')})"
+            f"与 GITHUB_APP_PRIVATE_KEY 是否属于**同一个且仍存在的** App"
+            f"(App 重建过、或私钥换过而 id 没换,都会让 JWT 认到一个没装的 App);"
+            f"③ GITHUB_APP_OWNER 是否正确 —— 当前解析出的 owner 是『{owner}』。"
+        )
     r.raise_for_status()
     body = {"repositories": [repo_only],
             "permissions": {"contents": "read", "pull_requests": "read"}}
@@ -190,6 +227,29 @@ def release_changes(source_repo: str, base: str, head: str, max_api_lookups: int
     return out
 
 
+def _deploy_ns(spec: dict, env: str) -> str:
+    """部署目标 namespace。只认 release 条目里显式配的 deploy.namespace。
+
+    🔴 不猜:配漏了就返回空串 → deploy_target_allowed 必然不匹配 → 不发券 →
+       流水线明确失败。曾经这里有一条"按项目名猜 namespace"的兜底,后果是
+       "配置没接上"这件事在某些项目上看不出来(它们恰好命中兜底)、
+       在另一些项目上突然炸 —— 一条路能走通,掩盖了另一条路根本没接上。
+    """
+    d = (spec.get("deploy") or {})
+    if d.get("namespace"):
+        return str(d["namespace"])
+    return ""
+
+
+def env_cluster(spec: dict, env: str) -> str:
+    """部署目标 cluster 名。优先 release 条目里的 deploy.cluster;
+    env=qa 时回落到名为 "qa" 的集群;生产必须由条目显式指定(同样不猜)。"""
+    d = (spec.get("deploy") or {})
+    if d.get("cluster"):
+        return str(d["cluster"])
+    return "qa" if env == "qa" else ""
+
+
 def dispatch_and_wait(spec: dict, timeout: int = 900):
     """触发 deploy.yml 并【等待该 run 跑完】,返回 (ok, log)。ok 反映 run 的真实结论,
     而不是"触发成功"——这样结果卡在部署真正结束时才弹。"""
@@ -199,8 +259,35 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
     if not (owner and repo and workflow):
         return False, "github 方式需要配置 github.owner / repo / workflow"
 
-    env = g.get("env", "prod")
+    # 🔴 刻意【不给默认值】。原实现是 g.get("env", "prod") —— 一旦某个 release 条目或
+    #    某个 stage 漏写 env,就会【静默派发到生产】。实测过一份真实配置:所有条目的
+    #    顶层 github.env 都是空的,全靠每个 stage 记得写 —— 这层安全建立在人工约定上。
+    #    改成 fail-close:解析不出 env 就拒绝派发,不猜。
+    env = g.get("env")
+    if not env:
+        return False, ("github.env 未配置,拒绝派发(刻意不默认 prod —— "
+                       "缺省值指向生产是这类设计最常见的致命错误)")
     inputs = {"app": spec["repo"], "tag": spec["tag"], "env": env}
+
+    # 部署凭据的一次性兑换券。流水线用它 + RELEASE_TOKEN 换 10 分钟绑定 token,
+    # 部署完回调撤销 —— 取代常驻 runner 的长期 kubeconfig(见 app/deploycred.py)。
+    #
+    # 🔴 grant 会进 run 元数据(GitHub UI 可见),所以它【本身不是集群凭据】:
+    #    必须再配 RELEASE_TOKEN 才能兑换,且一次性、10 分钟。
+    # 🔴 只在【该目标已登记 deploy_targets】时才发券。没登记就不发,
+    #    让流水线明确失败(强制动态凭据 = 没有凭据就不部署),
+    #    而不是让它悄悄回落到 runner 上的文件。
+    cred_target = k8s.deploy_target_allowed(env_cluster(spec, env), _deploy_ns(spec, env))
+    if cred_target:
+        grant, ttl = deploycred.issue_grant(spec.get("instance_code", "-"),
+                                            cred_target["cluster"], cred_target["namespace"])
+        inputs["cred_grant"] = grant
+        print(f"[github] 已签发部署凭据兑换券 target={cred_target['cluster']}/"
+              f"{cred_target['namespace']} ttl={ttl}m")
+    else:
+        print("[github] 目标未登记 deploy_targets,不发兑换券 "
+              "(流水线将因缺少动态凭据而失败 —— 这是刻意的 fail-close)")
+
     inputs.update(g.get("inputs", {}))
 
     # 派发重试:只在【连接层】失败时重试(ConnectionError 含 SSLError/ConnectTimeout,
@@ -287,7 +374,13 @@ def tag_commit(source_repo: str, tag: str) -> str | None:
     owner, repo_only = _split_owner_repo(source_repo, os.environ["GITHUB_APP_OWNER"])
     r = requests.get(f"{API}/repos/{owner}/{repo_only}/commits/{tag}",
                      headers=_read_headers(source_repo), timeout=10)
-    if r.status_code == 404:
+    # 🔴 「ref 不存在」在这个端点上是 **422**,不是 404(404 是仓库不存在/无权限)。
+    # 实测:GET /repos/{owner}/{repo}/commits/<不存在的 tag> → 422 Unprocessable Entity。
+    # 只处理 404 的话,422 会 raise_for_status 冒泡,被 /release 的宽捕获包成
+    # 502「check-prereq 无法校验」—— 而它本该是一句指向明确的 409「tag 不存在」。
+    # 那次排查绕了一大圈(App 安装 / 配置漂移 / 行号全被怀疑过一遍),
+    # 最后靠打印被 curl 丢掉的响应体才定案。
+    if r.status_code in (404, 422):
         return None
     r.raise_for_status()
     return r.json().get("sha")
@@ -311,3 +404,63 @@ def check_release_promotes_pre(source_repo: str, tag: str) -> tuple[bool, str]:
         return False, (f"`{tag}`({rel_sha[:7]}) 与 `{pre}`({pre_sha[:7]}) 指向不同 commit，"
                        f"生产会拿到未经 QA 验证的代码。release 必须打在与 `{pre}` 相同的 commit 上。")
     return True, ""
+
+
+# 破坏性 SQL 的识别规则。命中不代表一定有害,但审批人【必须看见】。
+# 🔴 为什么要专门标出来:镜像可以回滚,schema 不能。一个 DROP COLUMN 上线后,
+#    回滚镜像只会让旧代码去访问已经不存在的列 —— 回滚反而把故障扩大。
+_DANGER_SQL = [
+    (re.compile(r"\bDROP\s+(TABLE|COLUMN|INDEX|CONSTRAINT|SCHEMA)\b", re.IGNORECASE), "DROP"),
+    (re.compile(r"\bALTER\s+COLUMN\b[^;]*\bTYPE\b", re.IGNORECASE), "改列类型"),
+    (re.compile(r"\bSET\s+NOT\s+NULL\b", re.IGNORECASE), "加 NOT NULL"),
+    (re.compile(r"\bRENAME\s+(TO|COLUMN)\b", re.IGNORECASE), "重命名"),
+    (re.compile(r"\bTRUNCATE\b", re.IGNORECASE), "TRUNCATE"),
+    (re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE), "DELETE"),
+]
+
+
+def db_migration_changes(deploy_repo: str, since_iso: str | None,
+                         path: str = "db/migrations", max_commits: int = 10) -> dict:
+    """自 since_iso 起,迁移目录(通常在部署仓)发生了什么。
+
+    🔴 为什么需要它:审批卡此前只说"仅镜像变更 —— 未附带环境变量/配置变更",
+       而迁移文件常常放在【部署仓】、不在业务仓,release_changes 天然看不见。
+       于是一次带着 DROP COLUMN 的发版,审批人看到的仍然是"仅镜像变更"。
+
+    ⚖️ 口径:以"本应用上次成功部署的时间"为基线,不是"数据库里未应用的迁移"——
+       approvo 够不到数据库。所以卡片必须如实写明这是【时间口径】,
+       真正会执行哪些以迁移门禁为准。宁可说清楚口径,也不假装知道 DB 状态。
+
+    失败时返回 status='unknown' 并带上原因 —— 绝不返回"没有变更",
+    因为"查不到"和"没有"对审批人是完全不同的两件事。
+    """
+    if not since_iso:
+        return {"status": "unknown", "reason": "没有上次成功部署的时间基线(首次部署?)"}
+    try:
+        owner, repo_only = _split_owner_repo(deploy_repo, os.environ["GITHUB_APP_OWNER"])
+        h = _read_headers(deploy_repo)
+        r = requests.get(f"{API}/repos/{owner}/{repo_only}/commits",
+                         headers=h, timeout=15,
+                         params={"path": path, "since": since_iso, "per_page": max_commits})
+        r.raise_for_status()
+        commits = r.json()
+        if not commits:
+            return {"status": "none", "since": since_iso}
+        files: dict = {}
+        for cm in commits[:max_commits]:
+            d = requests.get(f"{API}/repos/{owner}/{repo_only}/commits/{cm['sha']}",
+                             headers=h, timeout=15).json()
+            for fl in d.get("files", []):
+                if not fl.get("filename", "").startswith(path):
+                    continue
+                name = fl["filename"].split("/")[-1]
+                ent = files.setdefault(name, {"name": name, "status": fl.get("status"), "danger": []})
+                patch = fl.get("patch") or ""
+                for rx, label in _DANGER_SQL:
+                    if rx.search(patch) and label not in ent["danger"]:
+                        ent["danger"].append(label)
+        return {"status": "ok", "since": since_iso,
+                "files": sorted(files.values(), key=lambda x: x["name"]),
+                "commits": len(commits)}
+    except Exception as e:      # 查不到 ≠ 没有:必须让卡片显示"无法判定"
+        return {"status": "unknown", "reason": f"{type(e).__name__}: {e}"}

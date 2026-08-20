@@ -4,7 +4,7 @@
 
 # 项目名前缀 (可选) - 显示在所有卡片标题最前面,方便多项目审批时一眼分辨.
 # 顶层默认,可被 release.project 或 POST /release body.project 覆盖.
-default_project: "MyProject"    # 比如 QHSE-UMP / MY-PROJECT 等
+default_project: "MyProject"    # 多项目共用一个 approvo/审批群时用来分辨
 
 feishu:
   # 审批定义(二选一,至少一个):
@@ -40,16 +40,72 @@ clusters:                                     # 供 method=kubectl / helm 使用
 # 只读凭证自助面板(POST /viewer-panel 往审批群发一张常驻卡,点按钮即签发)。
 # 目的:让"查日志"不必 ssh。API 形态要求人拿共享 token + 记住自己的 user_id + 会 curl,
 # 大部分人会觉得 ssh 更快 —— 通道存在 ≠ 人会用,所以要压成"点一下"。
+#
+# 🔴 每个目标的 `sa` 必须显式写(或配下面的 viewer_sa_default):approvo 不猜账号名。
+#    猜的后果是"拿着另一个环境的账号名去人家的命名空间",而万一同名 SA 恰好存在,
+#    签出来的权限就不是你以为的那个。未登记 / 未写 sa 一律拒绝签发(fail-close)。
+viewer_sa_default: ""                          # 可选:所有目标的兜底只读 SA 名;留空=必须逐目标写 sa
 viewer_targets:
   - label: "🔍 生产只读 30 分钟"
     cluster: "prod-cluster"
     namespace: "prod-namespace"
+    sa: "approvo-viewer"                       # 该 namespace 里的只读 ServiceAccount
     minutes: 30
     prod: true                                 # 生产按钮渲染成红色,点之前看得见
   - label: "🔍 QA 只读 30 分钟"
     cluster: "qa"
     namespace: "qa-namespace"
+    sa: "approvo-viewer"
     minutes: 30
+
+# Secret 变更通道(POST /secret/request → 审批 → POST /secret/commit)的目标白名单。
+# 🔴 不配 = 通道整体关闭(fail-close)。刻意如此:改 Secret 比签只读凭证破坏性更强
+#    (旧值不可恢复),不该"没配就全放开"。
+# release_key 可选:让不同项目的 Secret 变更走各自的 releases 条目,
+#    这样审批卡片上能看出"这是谁的变更";不写则回落到 secret_release_key。
+secret_release_key: my-secret                  # 需要在 releases 里有同名条目
+# secret_targets:
+#   - cluster: "prod-cluster"
+#     namespace: "prod-namespace"
+#   - cluster: "qa"
+#     namespace: "qa-namespace"
+#     release_key: my-secret
+
+# 部署凭据的动态签发(POST /deploy-credential,见 app/deploycred.py)。
+# 取代"把长期 kubeconfig 常驻在 runner 磁盘上":approvo 派发部署时签发一次性
+# 兑换券,流水线用它 + RELEASE_TOKEN 换一枚 10 分钟、限定 namespace、绑定一次性
+# 对象的 SA token,部署结束回调撤销。
+# 🔴 不配 = 整条通道关闭(fail-close),且【不发券】→ 强制动态凭据的流水线会明确失败。
+# 每项的 sa 必须显式写(同 viewer:不猜)。
+# deploy_targets:
+#   - cluster: "prod-cluster"
+#     namespace: "prod-namespace"
+#     sa: "approvo-deployer"                   # 该 ns 内的窄权限部署账号
+#   - cluster: "qa"
+#     namespace: "qa-namespace"
+#     sa: "approvo-deployer"
+
+# 机器人菜单(Lark 后台配的自定义菜单)可触发的动作白名单。
+# 不配则用 app/events.py 里的内置示例表;配了就完全以配置为准 ——
+# 让"开通一个新环境"变成改配置,而不必改代码。
+# 🔴 event_key 是【外部输入】(后台由人手填),没登记的一律拒绝,绝不按默认值兜底。
+# menu_targets:
+#   viewer_prod_app:
+#     kind: viewer                             # viewer / not_ready / release_key
+#     cluster: "prod-cluster"
+#     namespace: "prod-namespace"
+#     label: "示例应用 生产"
+#   viewer_qa_app:
+#     kind: viewer
+#     cluster: "qa"
+#     namespace: "qa-namespace"
+#     label: "示例应用 QA"
+#   viewer_prod_restricted:
+#     kind: not_ready                          # 明确回复"未开通",而不是抛一个看不懂的 403
+#     label: "受限环境 生产"
+#   release_token:
+#     kind: release_key
+#     label: "发版密钥"
 
 # 每个 release 的 method 决定部署路径:
 #   github  - 触发受限发版仓库的 workflow_dispatch (推荐,凭证隔离)
@@ -95,5 +151,27 @@ releases:
       repo: release-deploy                     # 【受限发版仓库】,所有 release 共用一个
       workflow: deploy.yml                     # 受限仓库里的部署 workflow (on: workflow_dispatch)
       ref: main
-      env: prod
+      env: prod                                # 🔴 必填:解析不出 env 就拒绝派发(绝不默认 prod)
       # inputs:                                # 可选,追加额外 workflow inputs
+    # 真实部署目标 —— 会显示在审批卡片上,并决定往哪个 cluster/namespace 签发部署凭据。
+    # 🔴 必须显式配:approvo 不按项目名/环境名猜 namespace。
+    #    配漏了就不发券、流水线明确失败,而不是"某些应用恰好能用"。
+    deploy:
+      cluster: "prod-cluster"                  # 需与 deploy_targets 里登记的组合一致
+      namespace: "prod-namespace"
+    # 可选:让审批卡片显示【数据库迁移变更】。
+    # 迁移文件通常在部署仓,业务仓的 compare 天然看不见它 ——
+    # 不配这段的话,一次带着 DROP COLUMN 的发版在卡片上仍然只写"仅镜像变更"。
+    # 查不到时卡片显示"无法判定"(绝不显示成"无变更")。
+    db_migrations:
+      repo: release-deploy                     # 迁移文件所在仓
+      path: db/migrations                      # 目录前缀(默认 db/migrations)
+    stages:                                    # 可选:一条 release 走多阶段
+      pre:
+        env: qa
+        github: {env: qa}
+        deploy: {cluster: "qa", namespace: "qa-namespace"}
+      release:
+        env: prod
+        github: {env: prod}
+        deploy: {cluster: "prod-cluster", namespace: "prod-namespace"}

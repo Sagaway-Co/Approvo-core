@@ -6,8 +6,12 @@
 
 | 攻击面 | 谁能碰 | 缓解 |
 | --- | --- | --- |
-| `/release` HTTP 接口 | 拿到 `RELEASE_TOKEN` 的攻击者 | `secrets.compare_digest` 常时对比;限流 60/min |
-| `/admin` 页 | 拿到 `ADMIN_PASSWORD` 的攻击者 | Basic Auth;`ADMIN_PASSWORD` 未设即禁用整个 admin |
+| `/release` HTTP 接口 | 拿到 `RELEASE_TOKEN` 的攻击者 | `secrets.compare_digest` 常时对比;**按端点分桶**限流,认证失败走独立拒绝桶 |
+| 匿名 DoS(用错 token 刷接口) | 任何能打到公网入口的人 | 曾经是**一个全局桶** ⇒ 单人可让整个网关瘫掉;现按端点分桶 + 认证失败不吃业务额度 |
+| `/admin` 页 | 拿到 `ADMIN_PASSWORD` 的攻击者 | Basic Auth(用户名默认 `admin`=已知)+ **暴力尝试有天花板**;`ADMIN_PASSWORD` 未设即禁用整个 admin |
+| 接口自描述信息 | 任何能打到公网入口的人 | `/docs`、`/redoc`、`/openapi.json` **默认关闭**(`ENABLE_DOCS=1` 才开) |
+| 改集群 Secret / 签发凭证的目标 | 拿到 `RELEASE_TOKEN` 的攻击者 | `cluster`/`namespace` 是请求体任意可填的 ⇒ 三条通道各有**配置白名单**,不配即整条关闭 |
+| 审批直通开关 | 有集群写权限的人 | 只能改 deployment 环境变量来开;**生产 fail-close**,且授权月跨月**自动失效** |
 | 飞书审批伪造 | 拿到审批群成员账号的攻击者 | 群成员=审批人;人事流程管拉群 |
 | GitHub App token 泄漏 | 拿到 `GITHUB_APP_PRIVATE_KEY` 的攻击者 | token 缩到单仓库 + 只 `actions:write`,50min 自动轮换 |
 | kubeconfig 泄漏 | 拿到 approvo 容器 shell 的攻击者 | 受限 SA (只对目标 ns 的 deployment 有 patch + rollout);建议 method=github 完全不放 |
@@ -33,10 +37,16 @@ approvo 的推荐部署形态是**只调 GitHub `workflow_dispatch`,不持任何
 
 approvo 的推荐 Ingress 配置(见 chart 或 [deploy/k8s.yaml](../deploy/k8s.yaml)):
 
-- **公网 Ingress** — 只暴露 `/release` + `/healthz`.**`/admin`、`/api/*` 在这条 Ingress 上没有路由**,公网够不到 (结构性隔离,不依赖认证)
+- **公网 Ingress** — **白名单式**暴露(默认 `/release` + `/healthz`;需要时再加 `/viewer-token`、
+  `/release-key`、`/deploy-credential`).**`/admin`、`/api/*` 在这条 Ingress 上没有路由**,
+  公网够不到 (结构性隔离,不依赖认证)
 - **内网 Ingress** — 全部路径 (含 `/admin`),仅内网 DNS 解析
 
 即使 `RELEASE_TOKEN` 泄漏,攻击者也无法调 `/admin` 修改 user_map.
+
+⚠️ **代价要知道**:新增端点必须**同步加路由**,否则公网调用得到的 404 与"路径不存在"完全一样、
+无法区分(实测踩过:某端点在 Pod 内是 401=存在,经网关是 404=没放行,流水线只报"HTTP 404")。
+判据:对照 `/release`(422=能到应用)与 `/no-such-path`(404),立刻分清是哪一层。
 
 ### 3. 飞书长连接 (出方向)
 
@@ -58,7 +68,7 @@ UPDATE releases SET status='deploying'
 
 `rowcount == 1` 才继续部署;失败(pending 已被别的线程翻掉)即返回.**这保证了每个 instance 只部署一次.**
 
-60s poller 也调 `process_instance`,同样受 CAS 保护.
+启动时的对账(`reconcile_pending_once`)也调 `process_instance`,同样受 CAS 保护.
 
 ## 已知安全边界
 
@@ -71,14 +81,51 @@ UPDATE releases SET status='deploying'
 ### 长连接故障恢复
 
 - 长连接断开时,飞书**不会重投**期间发生的事件
-- approvo poller 每 60s 对账 pending 实例,能补大部分漏事件
-- 极端场景:长连接持续断 60s 以上 → 事件确实丢 → poller 兜底恢复
+- approvo **启动时**对账一次 pending 实例 → 能补上"进程离线/重启期间被决策"的那些
+- ⚠️ **剩下的缺口**:若在运行中长连接抖动的那几秒里审批被决策,事件会丢,该 release 一直 pending
+  (表现为"批了却不部署",**不会误部署**)。恢复手段:重启 approvo(触发对账)。
+  彻底修法是在长连接**重连**回调里再对账一次 —— 而不是退回每分钟轮询(那会吃光 IM 的 API 月额度)
 
 ### 秘钥轮换
 
 - 飞书 App Secret / GitHub App private key / `RELEASE_TOKEN` / `ADMIN_PASSWORD` **必须定期轮换**(建议每 90 天)
 - 轮换步骤:改 secret → `kubectl rollout restart deploy/approvo` → 验证 `/healthz`
 - 长连接会自动重连 (新 secret 生效)
+
+### 动态部署凭据 (`/deploy-credential`)
+
+把"长期 kubeconfig 常驻 runner 磁盘"换成"每次部署签一副、用完即毁"。取舍与实测边界:
+
+- **两样都要**:`grant`(一次性、10 分钟、内存态)+ `RELEASE_TOKEN`。
+  只有 token 不够 —— 它是共享的,单凭它就能换到部署凭据等于把"能提审批"升级成"能直接部署";
+  只有 grant 也不够 —— grant 会作为 workflow 输入落进 run 元数据(GitHub UI 可见)。
+- **必须绑定一次性对象**:`TokenRequest` 的 TTL **下限是 10 分钟**(请求 1m/5m 会被 API server 直接拒绝),
+  而部署通常 1~2 分钟。删掉绑定对象后实测 **15 秒**内失效(认证缓存约 10 秒)
+  ⇒ 暴露窗口 = 部署时长 + ~15 秒,而不是 TTL 的 10 分钟。
+- **槽位固定名池 + 槽满即拒**:k8s 的 `create` 无法按资源名限制,但 `delete` 可以 ——
+  固定 8 个槽位名,RBAC 里 `delete` 用 `resourceNames` 限死这 8 个,
+  approvo 因此**没有**删该 namespace 里其它 Secret(比如数据库口令)的权限。
+  槽满时**拒绝签发**,绝不退化成"不绑定就签"。
+- **不落库**:grant 只活 10 分钟,落库会让它进数据库并被备份带走 ——
+  一个短命凭证不该有比自己更长的副本。approvo 重启即全部失效,这是期望行为。
+- ⚠️ **目标必须登记 `deploy_targets`**,否则**不发券**:让流水线明确失败,
+  而不是让它悄悄回落到 runner 上的文件(那正是这套机制要消灭的东西)。
+
+### 审批直通模式 (approval bypass)
+
+`APPROVAL_BYPASS`(见 [CONFIGURATION.md](CONFIGURATION.md#审批直通模式-approval-bypass))
+是一条**有意保留的、绕过审批门禁**的通道,用于审批平台不可用(如 IM 的 API 额度耗尽)时仍能发版。
+把它放进威胁模型是因为它降低了"人工把关"这层保障,其安全性依赖以下三条设计,缺一不可:
+
+- **生产 fail-close**:开启后 `env≠qa`(生产 / env 缺失)只落库置 `failed`、**绝不自动部署** ——
+  绕过的只是 QA,生产仍需人工线下执行,不存在"未经审批的版本被自动推上生产"。
+- **自带过期**:取值必须是授权月 `YYYY-MM`,跨月(下月 1 号 0 点)自动失效 ——
+  即便运维忘记关,门禁最长敞开到当月月底,而非无限期。
+- **可归因 + 可观测**:只能改 deployment 环境变量来开(需集群写权限,天然受 RBAC 约束),
+  且启动日志公示当前状态;它刻意不落 git,避免"配置漂移成常态"。
+
+⚠️ 开启期间 `/release` 的共享 `RELEASE_TOKEN` 就等价于"QA 直接发版权"(无审批兜底),
+因此**只应在需要时短期开启**,用完(或跨月自动失效后)确认已恢复需审批。
 
 ### 审批人指定
 

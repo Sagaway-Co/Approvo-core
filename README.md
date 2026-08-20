@@ -15,9 +15,15 @@
 approvo 的取舍:
 - **飞书长连接** — 无需公网入站入口,出方向能到 `open.feishu.cn:443` 即可
 - **动态审批人** — 审批人 = 审批群当前成员;拉/踢群 = 即时授权/撤销,不用改配置
-- **原子状态机** — SQLite `try_claim_for_deploy` CAS 防重复部署,60s 兜底轮询补漏事件
+- **原子状态机** — `try_claim_for_deploy` CAS 防重复部署,启动时对账一次补漏事件
 - **凭证隔离** — approvo 只调 GitHub `workflow_dispatch`,不持 kubeconfig;真实凭证只在受限发版仓
 - **变更清单** — 审批卡片自动列出 PR + 直接提交 + 作者,让 review 有事实基础
+- **数据库变更可见** — 迁移文件在部署仓、业务仓 compare 看不见,卡片会单独列出并给破坏性语句红标;
+  **查不到时明说"无法判定",绝不渲染成"无变更"**
+- **动态部署凭据** — 取代常驻 runner 的长期 kubeconfig:每次部署签一副 10 分钟、限定 namespace、
+  绑定一次性对象的 SA token,部署结束回调撤销(暴露窗口 ≈ 部署时长 + 15 秒)
+- **fail-close 到底** — 目标白名单不配即整条通道关闭;`env` / `deploy` / `sa` 漏配一律拒绝执行,
+  **绝不取一个指向生产的默认值**
 - **可替换** — provider (飞书/钉钉/Slack) + deployer (github/kubectl/helm) 抽象层就位
 
 ## 架构一览
@@ -30,7 +36,7 @@ approvo 的取舍:
                                              │ 落库 + 拉群成员 + 建飞书审批 + 发申请卡
                                              ▼
                                         (审批群任一成员点通过)
-                                             │ 长连接事件 (或 60s 轮询兜底)
+                                             │ 长连接事件 (启动时对账兜底)
                                              ▼
                                         try_claim_for_deploy (原子 CAS)
                                              │
@@ -110,7 +116,11 @@ helm upgrade approvo ./deploy/helm/approvo \
 - ❌ `helm upgrade` 不带 `-f` → chart 默认 `ingress.enabled: false` + 空 releases
 - ❌ `kubectl apply` / `kubectl patch secret` 直接改 approvo K8s 状态 → 状态漂移出 Git,下次 helm upgrade 又被冲
 
-任何环境改动 (加 sc-* 新应用 / 换 approval_code / 换 ingress 主机等) 都改 `deploy/environments/<env>.yaml` → 走 PR → merge → 跑上面 helm upgrade.
+任何环境改动 (加新应用 / 换 approval_code / 换 ingress 主机等) 都改 `deploy/environments/<env>.yaml` → 走 PR → merge → 跑上面 helm upgrade.
+
+> ⚠️ 一个例外:应急开关 `APPROVAL_BYPASS` 刻意**不进 git**(见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#审批直通模式-approval-bypass))——
+> 它用 `kubectl set env` 临时开,且跨月自动失效。代价是下一次 `helm upgrade` 会把它冲掉,
+> 而"被冲掉"= 回到需审批,正是安全的那一侧。
 
 ## 业务仓接入
 
@@ -124,6 +134,7 @@ helm upgrade approvo ./deploy/helm/approvo \
 ```
 app/
   main.py / server.py / events.py / settings.py / store.py       核心
+  keygrant.py / deploycred.py                                    一次性凭证兑换(取密钥 / 取部署凭据)
   forms.py / cards.py                                            审批表单 + 飞书卡片
   providers/{feishu,__init__}.py                                 ApprovalProvider ABC + 实现
   deployers/{github,kubectl,helm,dryrun,__init__}.py             Deployer ABC + 实现

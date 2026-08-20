@@ -44,7 +44,7 @@ def _md_safe(s: str) -> str:
 
 
 def _title_prefix(spec: dict) -> str:
-    """项目名前缀,让卡片标题一眼分清项目 (比如"QHSE-UMP · 发版申请 · 待审批")."""
+    """项目名前缀,让卡片标题一眼分清项目 (比如"MyProject · 发版申请 · 待审批")."""
     proj = spec.get("project")
     return f"{proj} · " if proj else ""
 
@@ -147,6 +147,50 @@ def _env_change_block(spec: dict) -> list:
     return [{"tag": "div", "text": {"tag": "lark_md", "content": "**🔧 环境变更**\n" + body}}]
 
 
+def _db_change_block(spec: dict) -> list:
+    """「数据库变更」区块 —— 只要这条 release 配了迁移目录,就【固定显示】。
+
+    🔴 为什么必须有:在此之前,一次带着迁移的发版,卡片上只写
+       "仅镜像变更 —— 未附带环境变量/配置变更"。审批人以为自己批的是换镜像,
+       实际发生的是改生产库结构 —— 因为迁移文件在部署仓,
+       业务仓的变更清单天然看不见它。
+
+    ⚖️ 三种状态严格区分,不许混:
+       ok    → 列出文件,破坏性语句加红标
+       none  → 该时间基线之后确实没有迁移变更
+       unknown → 【查不到】。绝不显示成"没有变更" —— 那是把无知包装成安全。
+
+    ⚠️ 没有 `db_changes` 字段(= 这条 release 没配 `db_migrations`)时返回空列表:
+       没开这个功能的应用不该被塞一行"无法判定"的噪音。
+       但只要开了、哪怕查询失败,就必须如实显示"无法判定"。
+    """
+    d = spec.get("db_changes")
+    if d is None:
+        return []
+    st = (d or {}).get("status")
+    if st == "ok" and d.get("files"):
+        rows = []
+        for f in d["files"][:15]:
+            mark = {"added": "新增", "modified": "修改", "removed": "删除"}.get(f.get("status"), f.get("status") or "")
+            danger = ("  🔴 " + " / ".join(f["danger"])) if f.get("danger") else ""
+            rows.append(f"`{_md_safe(f['name'])[:80]}` {mark}{danger}")
+        more = f"\n… 共 {len(d['files'])} 个文件" if len(d["files"]) > 15 else ""
+        note = ("\n⚠️ 口径:自本应用上次成功部署以来的变更(时间口径);"
+                "实际会执行哪些以迁移门禁为准。")
+        warn = ("\n🔴 含破坏性语句 —— 镜像可回滚、schema 不可回滚,"
+                "回滚镜像只会让旧代码撞上已变的表结构。"
+                if any(f.get("danger") for f in d["files"]) else "")
+        return [{"tag": "div", "text": {"tag": "lark_md",
+                 "content": "**🗄 数据库变更**\n" + "\n".join(rows) + more + note + warn}}]
+    if st == "none":
+        return [{"tag": "div", "text": {"tag": "lark_md",
+                 "content": "**🗄 数据库变更**\n无 —— 自上次成功部署以来迁移目录没有变更"}}]
+    reason = (d or {}).get("reason") or "未查询"
+    return [{"tag": "div", "text": {"tag": "lark_md",
+             "content": f"**🗄 数据库变更**\n⚠️ 无法判定（{_md_safe(str(reason))[:100]}）"
+                        f" —— 请在批准前自行确认本次是否含迁移"}}]
+
+
 def submit_card(spec: dict) -> dict:
     """详细申请卡 → 审批群。生产/紧急发版会加 ⚠️ 围栏 + 红色 header + 强化提示."""
     is_prod = _is_prod(spec)
@@ -169,6 +213,7 @@ def submit_card(spec: dict) -> dict:
         ])},
         _image_block(spec),
         *_env_change_block(spec),
+        *_db_change_block(spec),
         *_changes_block(spec),
         {"tag": "note", "elements": [{"tag": "plain_text", "content": note_content}]},
     ]
@@ -199,6 +244,7 @@ def deploying_card(spec: dict, approver_name: str | None = None, when: str | Non
         ])},
         _image_block(spec),
         *_env_change_block(spec),
+        *_db_change_block(spec),
     ]
     if is_prod:
         body = [_prod_warning()] + body + [_prod_warning()]
@@ -239,6 +285,7 @@ def result_card(spec: dict, ok: bool = True, rejected: bool = False, status: str
         ])},
         _image_block(spec),
         *_env_change_block(spec),
+        *_db_change_block(spec),
     ]
     # 仅「版本已部署」同步带变更清单(部署中/失败/拒绝卡不带,不另发卡片)
     if ok and not rejected:
@@ -310,7 +357,7 @@ def viewer_deliver_text(kubeconfig: str, cluster: str, namespace: str, minutes: 
     return (
         f"🔍 只读 kubeconfig 已签发（{cluster} / {namespace}，{minutes} 分钟后失效）\n"
         f"\n用法：把下面整段存成文件后\n"
-        f"  export KUBECONFIG=~/sc-viewer.yaml\n"
+        f"  export KUBECONFIG=~/viewer.yaml\n"
         f"  kubectl -n {namespace} get pods\n"
         f"  kubectl -n {namespace} logs -f <pod名>\n"
         f"\n只读：不能 exec、不能改、看不到 secrets。过期后重新点按钮即可。\n"
@@ -366,6 +413,6 @@ def secret_done_card(ns: str, name: str, key: str, fingerprint: str, when: str) 
             ])},
             {"tag": "note", "elements": [{"tag": "plain_text", "content":
              "值不落库、不入 git、不进日志；此处只记指纹以便事后核对版本。"
-             "如引用该 Secret 的服务需重启才生效，请另走 sc-config-change 通道。"}]},
+             "如引用该 Secret 的服务需重启才生效，请另走配置变更通道。"}]},
         ],
     }

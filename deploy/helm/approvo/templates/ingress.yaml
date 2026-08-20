@@ -4,7 +4,8 @@
 {{- $className := .Values.ingress.className -}}
 {{- if .Values.ingress.public.enabled }}
 ---
-# 公网入口:结构性只暴露 /release 与 /healthz;/admin、/api/* 不在此 Ingress 上,公网够不到.
+# 公网入口:只放行 ingress.public.paths 里列出的路径(默认 /release 与 /healthz);
+# /admin、/api/* 不在此 Ingress 上 → 公网够不到,这是结构性隔离(不依赖认证,依赖路由).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -21,12 +22,11 @@ spec:
     - host: {{ .Values.ingress.public.host }}
       http:
         paths:
-          - path: /release
+          {{- range (.Values.ingress.public.paths | default (list "/release" "/healthz")) }}
+          - path: {{ . }}
             pathType: Prefix
             backend: {service: {name: {{ $svc }}, port: {number: {{ $port }}}}}
-          - path: /healthz
-            pathType: Prefix
-            backend: {service: {name: {{ $svc }}, port: {number: {{ $port }}}}}
+          {{- end }}
 {{- end }}
 {{- if .Values.ingress.admin.enabled }}
 ---

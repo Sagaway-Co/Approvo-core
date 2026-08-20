@@ -21,6 +21,8 @@ secrets:
   FEISHU_APP_SECRET: ""
   LARK_ENDPOINT: "feishu"       # feishu(国内, open.feishu.cn) / lark(海外, open.larksuite.com) / 或完整 URL
   RELEASE_TOKEN: ""             # /release 接口的共享密钥;留空=不校验
+  PUBLIC_GATE_URL: ""           # 对外入口(仅用于在提示信息里拼可复制的 curl);留空=提示里显示占位符
+  ENABLE_DOCS: ""               # 置 1 才暴露 /docs、/redoc、/openapi.json;默认关(fail-close)
   ADMIN_USER: "admin"
   ADMIN_PASSWORD: ""            # 留空=/admin 禁用 (安全默认)
   GITHUB_APP_ID: ""
@@ -48,11 +50,19 @@ service:
 ingress:
   enabled: true
   className: nginx               # 按你的集群 Ingress controller 调整
-  ## 公网入口 - 建议只暴露 /release + /healthz (结构性隔离)
+  ## 公网入口 - 只暴露白名单里的路径 (结构性隔离:不依赖认证,依赖路由)
+  ## 🔴 新增端点要【同步加进这个列表】,否则公网调用只会得到一个与"路径不存在"
+  ##    完全无法区分的 404。需要动态部署凭据时加 /deploy-credential(Prefix 覆盖 revoke)。
   public:
     enabled: true
     host: release.example.com
     tls: []                       # [{secretName: ..., hosts: [...]}]
+    paths:
+      - /release
+      - /healthz
+      # - /viewer-token
+      # - /release-key
+      # - /deploy-credential
   ## 内网管理入口 - 暴露全部 (含 /admin);仅内网 DNS
   admin:
     enabled: true
