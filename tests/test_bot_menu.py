@@ -81,7 +81,7 @@ def test_not_in_group_refused():
     assert "不在审批群" in st.call_args[0][1]
 
 
-def test_hse_returns_human_readable_message():
+def test_not_ready_target_returns_human_readable_message():
     """受限环境未开通要说人话，而不是抛 403。"""
     with mock.patch.object(events.feishu, "get_chat_members", return_value=["u_x"]), \
          mock.patch.object(events.feishu, "send_text", return_value=(True, "")) as st, \

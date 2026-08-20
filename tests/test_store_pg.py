@@ -108,6 +108,47 @@ def test_last_success_commit_prefers_explicit_commit(store):
     assert store.last_success_commit("my-app") == "deadbeef"
 
 
+# ---------- stage 感知:同一个 tag 发到两个环境是两件事 ----------
+#
+# 🔴 这三条必须打真库:它们验的是 `spec_json::jsonb->>'stage'` 这句 SQL 本身。
+#    以前这三个基线都不带 stage,后果分别是:
+#      · status_history      → 生产提交被当成"已部署"静默跳过(HTTP 200,实际没执行)
+#      · last_success_commit → 卡片谎报"无新增提交"
+#      · last_success_at     → 卡片谎报"迁移目录没有变更"
+#    后两条是【谎报安全】,比报错更危险。
+
+def test_status_history_filters_by_stage(store):
+    """同 repo+tag、不同 stage → 判重时必须分开看。"""
+    store.save("ic-qa", _spec(tag="sha-abc", stage="pre"))
+    store.set_status("ic-qa", "success")
+    store.save("ic-prod", _spec(tag="sha-abc", stage="release"))
+
+    assert store.status_history("my-app", "sha-abc", "pre") == ["success"]
+    assert store.status_history("my-app", "sha-abc", "release") == ["pending"]
+    # 不传 stage 时退化为旧行为(两条都算),保持既有调用兼容
+    assert sorted(store.status_history("my-app", "sha-abc")) == ["pending", "success"]
+
+
+def test_last_success_commit_is_stage_scoped(store):
+    store.save("ic-qa", _spec(tag="V2-pre", stage="pre", commit="aaaaaaa"))
+    store.set_status("ic-qa", "success")
+    store.save("ic-prod", _spec(tag="V1-release", stage="release", commit="bbbbbbb"))
+    store.set_status("ic-prod", "success")
+
+    assert store.last_success_commit("my-app", "pre") == "aaaaaaa"
+    assert store.last_success_commit("my-app", "release") == "bbbbbbb"
+    assert store.last_success_commit("my-app", "hotfix") is None, "别的 stage 不该借用基线"
+
+
+def test_last_success_at_is_stage_scoped(store):
+    store.save("ic-qa", _spec(tag="V2-pre", stage="pre"))
+    store.set_status("ic-qa", "success")
+    assert store.last_success_at("my-app", "pre")
+    assert store.last_success_at("my-app", "release") is None, \
+        "生产没有成功记录时必须返回 None(→ 卡片显示『无法判定』,而不是『无变更』)"
+    assert store.last_success_at("从没发过的仓") is None
+
+
 def test_last_success_commit_falls_back_to_tag_sha(store):
     store.save("ic-1", _spec(tag="v20260810.abc1234"))
     store.set_status("ic-1", "success")

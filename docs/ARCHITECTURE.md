@@ -41,7 +41,7 @@ approvo 的核心承诺是 **"审批通过之前不允许部署,审批通过之�
                     │  │    (compare API + PR 归属)             │ │
                     │  └───────────────────────────────────────┘ │
                     │                                            │
-                    │  poller: 每 60s 对账 pending 实例 (兜底)      │
+                    │  启动时对账一次 pending 实例 (兜底)            │
                     └────────────────────────────────────────────┘
                                         │
                                         ▼
@@ -121,12 +121,19 @@ UPDATE releases SET status='deploying', updated_at=?
 ```
 返回 `rowcount == 1` 才算抢到.这样即使长连接事件重投或轮询同时命中,也只有一个线程会走到 `deploy(spec)`.
 
-### events.py — 事件处理 + 60s 轮询兜底
+### events.py — 事件处理 + 启动对账
 
 - **长连接 handler** (`build_handler`):`approval_instance` 事件 → `process_instance(instance_code)`
-- **poller_loop**:每 60s 扫 `store.list_pending()`,对每个 pending 实例调 `feishu.get_instance` 拉真实状态,补处理漏掉的事件
+- **reconcile_pending_once**:**进程启动时**扫一遍 `store.list_pending()`,对每个 pending 实例调 `feishu.get_instance` 拉真实状态,补处理离线期间漏掉的事件
 
-**为什么要 poller?** 长连接偶发会丢事件 (连接抖动、重启);60s 轮询保证最终一致.
+**为什么不再每 60s 轮询?** 轮询是按 pending 条数 × 分钟数计费的:审批"等人点通过"往往要几小时,
+一条审批过一夜≈近千次 API 调用,而这些调用**什么也没发现**——实时性本来就由长连接推送保证。
+实测这一项几乎吃光了 IM 租户的基础 API 月额度,于是改为**只在启动时对账一次**:
+成本 = 启动瞬间的 pending 条数(通常为 0),稳态调用量接近 0.
+
+⚠️ **残留风险(已知,写在代码注释里)**:若在**运行中**长连接恰好抖动的那几秒里审批被决策,
+该事件可能丢,这条 release 会一直 pending 且不部署 —— 当前靠"下次重启时的对账"补上。
+要彻底覆盖应在长连接**重连**回调里再对账一次,而不是退回按分钟轮询。
 
 ### providers/feishu.py + app/feishu.py — 飞书 API 封装
 

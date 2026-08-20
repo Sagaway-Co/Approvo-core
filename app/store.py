@@ -36,7 +36,7 @@ def _get_pool() -> ConnectionPool:
     """懒初始化连接池(双重检查加锁)。
 
     🔴 这里必须加锁:approvo 是【多线程】的 —— 部署丢线程、只读签发丢线程、
-    poller 独立线程、uvicorn 还会并发处理请求。无锁的懒初始化会让两个线程
+    启动对账/部署/只读签发各自独立线程、uvicorn 还会并发处理请求。无锁的懒初始化会让两个线程
     同时看到 _pool is None 各建一个池,被覆盖的那个【已经建好连接却永远不会关闭】,
     形成连接泄漏;而 RDS 的连接数是有上限的。
     概率低不等于不会发生,且它只会在启动瞬间偶发 —— 这种 bug 最难查。
@@ -87,7 +87,7 @@ def init():
                 updated_at text)"""
         )
         # 这两个索引 SQLite 版没有(单文件全表扫也够快),PG 上给高频查询补上:
-        # list_pending 每 60s 被 poller 调一次;last_success_commit 每次发版都查。
+        # list_pending 启动对账时查一次;last_success_commit 每次发版都查。
         c.execute("create index if not exists idx_releases_status on releases(status)")
         c.execute("create index if not exists idx_releases_repo_tag on releases(repo, tag)")
 
@@ -124,24 +124,45 @@ def set_status(instance_code: str, status: str):
                   (status, _now(), instance_code))
 
 
-def status_history(repo: str, tag: str) -> list[str]:
-    """同 repo+tag 的全部历史状态(新→旧),用于判断重复提交还是被拒后重发。"""
+def status_history(repo: str, tag: str, stage: str | None = None) -> list[str]:
+    """同 repo+tag(+stage) 的全部历史状态(新→旧),用于判断重复提交还是被拒后重发。
+
+    🔴 为什么必须把 stage 算进去:
+    普通发版的 tag 天然带环境(V1.2.3-pre / -release),所以 repo+tag 判重够用。
+    但【同一个 tag 要发到两个环境】的通道不是这样:
+      · 例如"部署仓的数据库迁移"这类条目,tag 是部署仓的 commit sha —— 两个环境完全相同
+      · 于是 QA 应用成功后,提交生产会被判成"already deployed"而静默跳过
+    实测:同一个迁移文件先发 QA 成功,再发生产直接返回 {"skipped":"already deployed"},
+    生产【根本没执行】,而返回码是 200 —— 看起来像成功。这类"静默跳过"比报错危险得多。
+
+    stage=None 时退化为旧行为(按 repo+tag),保持既有调用兼容。
+    """
+    sql = ("select status from releases where repo=%s and tag=%s"
+           + (" and spec_json::jsonb->>'stage' = %s" if stage else "")
+           + " order by created_at desc")
+    args = (repo, tag, stage) if stage else (repo, tag)
     with _conn() as c:
-        return [r["status"] for r in c.execute(
-            "select status from releases where repo=%s and tag=%s order by created_at desc",
-            (repo, tag)).fetchall()]
+        return [r["status"] for r in c.execute(sql, args).fetchall()]
 
 
 TAG_SHA_RE = re.compile(r"\.([0-9a-f]{7,40})$")   # 镜像 tag 约定 vYYYYMMDD.<short_sha>
 
 
-def last_success_commit(repo: str) -> str | None:
+def last_success_commit(repo: str, stage: str | None = None) -> str | None:
     """该应用最近一次部署成功的 commit,作变更清单对比的 base。
-    只有 gate 知道线上真正部署到了哪个版本(构建≠部署,中间可能有被拒的)。"""
+    只有 gate 知道线上真正部署到了哪个版本(构建≠部署,中间可能有被拒的)。
+
+    🔴 必须能按 stage 取(同族第三处):基线要取【同环境】的上次成功。
+    否则"先发 QA 再发生产"时,生产的基线会取到刚才那次 QA 成功,
+    于是卡片显示"与已部署版本相比无新增提交" —— 而生产其实要装一个全新版本。
+    普通发版的 tag 天然带环境所以不明显;同一 tag 发两个环境的通道会直接暴露。
+    """
+    cond = " and spec_json::jsonb->>'stage' = %s" if stage else ""
+    args = (repo, stage) if stage else (repo,)
     with _conn() as c:
         rows = c.execute(
-            "select spec_json from releases where repo=%s and status='success' "
-            "order by updated_at desc limit 5", (repo,)).fetchall()
+            "select spec_json from releases where repo=%s and status='success'"
+            + cond + " order by updated_at desc limit 5", args).fetchall()
     for r in rows:   # 部分 CI 没传 commit,从 tag 末段抽短 sha 兜底;都没有再往前看
         spec = json.loads(r["spec_json"]) or {}
         if spec.get("commit"):
@@ -153,6 +174,25 @@ def last_success_commit(repo: str) -> str | None:
 
 
 # ---------- github 用户名 -> 飞书 user_id 映射(运行时可改,/admin 维护)----------
+
+def last_success_at(repo: str, stage: str | None = None) -> str | None:
+    """该应用最近一次【部署成功】的时间,用作"数据库迁移变更"的时间基线。
+
+    与 last_success_commit 同源:只有 gate 知道线上真正部署到了哪个版本/什么时候。
+    迁移文件在部署仓而非业务仓,没有 commit 可比,只能用时间口径 ——
+    卡片里必须如实写明这一点,不能让审批人误以为它等于"数据库里未应用的迁移"。
+
+    🔴 同样必须能按 stage 取(同族第四处):否则"先 QA 再生产"时,生产会以
+    刚才那次 QA 成功为基线,把本次真实的迁移新增显示成"无变更"—— 谎报安全。
+    """
+    cond = " and spec_json::jsonb->>'stage' = %s" if stage else ""
+    args = (repo, stage) if stage else (repo,)
+    with _conn() as c:
+        row = c.execute(
+            "select updated_at from releases where repo=%s and status='success'"
+            + cond + " order by updated_at desc limit 1", args).fetchone()
+    return row["updated_at"] if row else None
+
 
 def usermap_list() -> list[dict]:
     with _conn() as c:

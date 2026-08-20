@@ -1,8 +1,15 @@
-"""审批处理 + 对账轮询。
+"""审批处理 + 启动对账。
 
-长连接的 approval_instance 事件偶发会丢(连接抖动、重启),靠 poller 每 60s 查 pending
-实例在飞书的真实状态兜底。事件和轮询都调 process_instance,用 store.try_claim_for_deploy
-原子去重,绝不重复部署。
+实时性由长连接的 approval_instance 事件推送保证。事件偶发会丢(连接抖动、重启),
+所以【启动时】对账一次:把进程离线期间被决策、事件没收到的 pending 实例补处理掉。
+
+🔴 为什么不再常驻每 60s 轮询:
+   原实现对【每条 pending】每 60s 调一次 get_instance,而审批等人点通过往往要
+   几小时 —— 一条审批过一夜≈近千次调用。用真实数据核算过:两周的发版量就累积出
+   几千次轮询调用,几乎吃光 IM 租户的基础 API 月额度,而这些调用【什么也没发现】。
+   轮询本是为兜"长连接偶发丢事件",但实时性本就由推送保证,它不该按分钟计费。
+
+事件和对账都走 process_instance,用 store.try_claim_for_deploy 原子去重,绝不重复部署。
 """
 import json
 import threading
@@ -182,7 +189,10 @@ def _viewer_worker(open_id: str, user_id: str, cluster: str, namespace: str, min
 # 菜单 event_key -> 动作。🔴 event_key 是【外部输入】(在 Lark 后台由人手填)，
 # 同样走白名单：没登记的一律拒绝，绝不按"默认值"兜底 ——
 # 缺省值指向生产是这类设计最常见的致命错误。
-MENU_TARGETS: dict[str, dict] = {
+#
+# 优先用 config 的 `menu_targets`;没配则用下面的内置示例表 —— 让"开通一个新环境"
+# 从改代码变成改配置,同时不改变既有部署的行为。
+MENU_TARGETS: dict[str, dict] = settings.MENU_TARGETS or {
     "viewer_prod_app": {"kind": "viewer", "cluster": "prod-cluster", "namespace": "prod-namespace",
                             "label": "示例应用 生产"},
     "viewer_qa_app":   {"kind": "viewer", "cluster": "qa", "namespace": "qa-namespace",
@@ -324,13 +334,21 @@ def build_handler():
             .build())
 
 
-def poller_loop():
-    """对账兜底:每 60s 查 pending 实例的真实状态,补处理漏掉的事件。"""
-    while True:
-        time.sleep(60)
-        try:
-            pend = store.list_pending()
-            for ic in pend:
-                process_instance(ic)
-        except Exception as e:
-            print(f"[poller] error: {e}")
+def reconcile_pending_once():
+    """启动时对账一次:把进程离线/重启期间被决策、长连接没收到的 pending 实例补处理掉。
+
+    🔴 只跑一次,不再常驻轮询(原因见模块 docstring:常驻轮询会吃光 IM 的 API 月额度)。
+    调用成本 = 启动瞬间的 pending 条数,通常为 0;每次重启才发生一次。
+
+    ⚠️ 残留风险:若在【运行中】长连接恰好抖动的那几秒里某条审批被决策,该事件可能丢,
+    这条 release 会一直 pending 且不部署。当前靠"下次重启时的这次对账"补上。若要覆盖
+    运行中丢事件,应在长连接【重连】回调里再调一次本函数(而不是退回按分钟轮询)。
+    """
+    try:
+        pend = store.list_pending()
+        print(f"[reconcile] 启动对账:{len(pend)} 条 pending 待核对")
+        for ic in pend:
+            process_instance(ic)
+        print("[reconcile] 启动对账完成")
+    except Exception as e:
+        print(f"[reconcile] error: {e}")

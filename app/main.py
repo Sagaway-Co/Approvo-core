@@ -8,7 +8,7 @@ import lark_oapi as lark
 import uvicorn
 
 from app import feishu, settings
-from app.events import build_handler, poller_loop
+from app.events import build_handler, reconcile_pending_once
 
 
 def _run_ws():
@@ -29,8 +29,10 @@ def main():
         print(f"[main] subscribe error: {e}")
 
     threading.Thread(target=_run_ws, daemon=True).start()
-    threading.Thread(target=poller_loop, daemon=True).start()   # 对账兜底
-    print(f"[main] http listening on :{settings.PORT}, ws + poller started")
+    # 启动时对账一次:补上进程离线/重启期间被决策、长连接没收到的审批。
+    # 稳态实时性由长连接推送保证,不再每分钟轮询(那会吃光 IM 的 API 月额度)。
+    threading.Thread(target=reconcile_pending_once, daemon=True).start()
+    print(f"[main] http listening on :{settings.PORT}, ws started + startup reconcile queued")
     uvicorn.run("app.server:app", host="0.0.0.0", port=settings.PORT, log_level="info")
 
 

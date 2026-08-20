@@ -85,8 +85,17 @@ spec:
   selector: {app: approvo}
   ports: [{port: 8700, targetPort: 8700}]
 ---
-# 公网入口:建议只暴露 /release 和 /healthz。/admin 和 /api/* 在这条路径上没有路由 →
-# 公网够不到,结构性隔离(不依赖认证,依赖路由)。
+# 公网入口:白名单式暴露。/admin 和 /api/* 在这条路径上【没有路由】→ 公网够不到,
+# 这是结构性隔离(不依赖认证,依赖路由),比"加了鉴权"更硬。
+#
+# 🔴 加新端点时【必须同步加路由】,否则公网调用得到 404,而这个 404 与"路径不存在"
+#    完全一样、无法区分。实测踩过:/deploy-credential 在 Pod 内是 401(存在),
+#    经网关是 404(没放行),流水线在"取动态部署凭据"这步失败,报错只说 HTTP 404。
+#    判据:对照 /release(422=能到应用) 与 /no-such-path(404),立刻分清是哪一层。
+#
+# 需要公网可达的端点按需放行;下面给出的是一套常见组合:
+#   /release  /healthz  /viewer-token  /release-key
+#   /deploy-credential(Prefix,同时覆盖 /deploy-credential/revoke)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -100,6 +109,10 @@ spec:
         paths:
           - {path: /release, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
           - {path: /healthz, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
+          - {path: /viewer-token, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
+          - {path: /release-key, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
+          # Prefix 同时覆盖 /deploy-credential/revoke
+          - {path: /deploy-credential, pathType: Prefix, backend: {service: {name: approvo, port: {number: 8700}}}}
 ---
 # 内网管理入口:/admin 全功能走这里,只在办公网 DNS 解析,绝不挂公网
 apiVersion: networking.k8s.io/v1
