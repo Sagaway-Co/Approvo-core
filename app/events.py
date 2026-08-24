@@ -208,6 +208,13 @@ MENU_TARGETS: dict[str, dict] = settings.MENU_TARGETS or {
 _MENU_LAST: dict[str, float] = {}      # 点击者 -> 上次触发时间，防误触/连点
 _MENU_COOLDOWN_SEC = 5
 
+# 启动对账的单次上限与节流。对账是【突发】调用:所有 pending 在启动瞬间集中核对,
+# 每条至少一次 feishu.get_instance()。原实现无上限 —— 若积压上百条,一次重启就是
+# 上百次突发调用,而 IM 的 API 月额度正是被这类高频调用吃光的。
+# 取 50:够覆盖"正常运转下的零星积压",又不会让一次重启打出去太多。
+RECONCILE_MAX = 50
+RECONCILE_GAP_SEC = 0.2
+
 
 def _dm(open_id: str, user_id: str, text: str) -> None:
     """私聊回复点击者。open_id 恒有，user_id 需应用权限，故优先 open_id。"""
@@ -346,9 +353,24 @@ def reconcile_pending_once():
     """
     try:
         pend = store.list_pending()
-        print(f"[reconcile] 启动对账:{len(pend)} 条 pending 待核对")
-        for ic in pend:
+        total = len(pend)
+        batch = pend[:RECONCILE_MAX]
+        skipped = total - len(batch)
+        print(f"[reconcile] 启动对账:{total} 条 pending,本次处理 {len(batch)} 条"
+              + (f",跳过 {skipped} 条" if skipped else ""))
+        # 🔴 被跳过【必须显式告警】。原实现无上限,积压多少就一次性打出去多少;
+        #    但只加上限而不喊出来,就是把"突发打爆额度"换成"静默不对账" ——
+        #    同一类错误(判据落在不反映真实情况的指标上)的又一次复发。
+        if skipped:
+            print(f"[reconcile][warn] 仍有 {skipped} 条 pending 未核对(单次上限 "
+                  f"{RECONCILE_MAX})。它们要等【下次重启】才会被处理 —— 若这个数字"
+                  f"长期不降,说明有陈旧 pending 堆积,应人工清理而不是靠对账兜。")
+        for i, ic in enumerate(batch):
             process_instance(ic)
-        print("[reconcile] 启动对账完成")
+            # 每条之间留间隔:对账是【突发】调用(启动瞬间集中发生),而 IM 额度按月计。
+            # 额度被吃光的直接诱因就是高频调用,这里刻意把速率压住。
+            if i + 1 < len(batch):
+                time.sleep(RECONCILE_GAP_SEC)
+        print(f"[reconcile] 启动对账完成(处理 {len(batch)} 条)")
     except Exception as e:
         print(f"[reconcile] error: {e}")

@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from app import cards, deploycred, feishu, forms, github, k8s, keygrant, settings, store
+from app import cards, deploycred, feishu, forms, github, k8s, keygrant, settings, store, wshealth
 
 
 @asynccontextmanager
@@ -168,7 +168,42 @@ class ReleaseReq(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    """存活探针(liveness)。🔴 刻意【即使审批链路挂了也返回 200】。
+
+    ⚖️ 为什么不让它变红:容器编排的 readinessProbe 通常指着它。若 WS 挂就返回 503,
+    实例会被摘出服务发现 → 连 /healthz 和 /admin 都够不到 → 现场无法诊断,
+    而 CI 侧只会看到"连不上 gate"这种无信息量的错误。
+    故:存活与"能力可用"分开两个端点,body 里把真实状态如实带出来。
+    要做能力告警请用 /readyz(见下)。
+    """
+    return {"ok": True, "ws": wshealth.snapshot()}
+
+
+@app.get("/readyz")
+def readyz():
+    """能力探针:审批链路(长连接)是否真的可用。不可用 → 503。
+
+    🔴 为什么必须和 /healthz 分开:
+    无效凭证下 WS 线程崩死,而容器 ready=true、restarts=0、/healthz={"ok":true} ——
+    判据落在了一个不反映真实能力的指标上。卡片照样能创建、人照样能点通过,
+    但事件永远收不到,什么都不会部署,也没有任何告警。
+
+    用途:外部监控/拨测指这里。**不要**把容器编排的 readinessProbe 指过来
+    (理由见 /healthz 注释:摘掉实例会让诊断和 fail-close 都变差)。
+    """
+    st = wshealth.snapshot()
+    bypass = settings.approval_bypass_on()
+    # 直通模式下发版不依赖长连接(qa 直接部署 / 生产只留痕),此时 WS 挂不影响发版能力。
+    # 但仍如实报告 degraded,不然"开着 bypass 时 WS 挂了"会被永久掩盖。
+    ok = st["healthy"] or bypass
+    body = {"ok": ok, "ws": st, "approval_bypass": bypass,
+            "detail": None if st["healthy"] else
+                      ("长连接不可用,但审批直通已开启 —— 发版仍可进行,审批事件链路仍是坏的"
+                       if bypass else
+                       "长连接不可用 —— 审批事件收不到,批准后也不会部署")}
+    if not ok:
+        raise HTTPException(503, body["detail"])
+    return body
 
 
 @app.get("/")
@@ -441,6 +476,22 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
     # 常态下(未开开关)本分支不生效,继续走标准审批流程。
     if settings.approval_bypass_on():
         return _bypass_release(f"bypass:{uuid}", spec, env)
+
+    # ── 审批链路 fail-close ────────────────────────────────────────────
+    # 🔴 长连接死了 → 审批事件收不到 → 建了实例、人点了通过,也【永远不会部署】。
+    #    此时受理请求等于【静默积压】:CI 拿到 2xx 以为发版已进入流程,审批群里
+    #    卡片也正常出现,人点完通过就走了 —— 没有任何一环会报错,直到有人发现
+    #    某个版本压根没上线。宁可在这里明确拒绝,让 CI 当场红掉。
+    #    (实测:WS 线程崩死时容器 ready、/healthz 绿、卡片能发、人能点通过 ——
+    #     判据落在了不反映真实能力的指标上。见 app/wshealth.py)
+    # ⚖️ 放在 bypass 分支【之后】:直通模式不依赖长连接(qa 直接部署、生产只留痕),
+    #    那条路径不该被 WS 状态拦住 —— 否则 IM 出问题时连应急通道也一起堵死。
+    if not wshealth.healthy():
+        st = wshealth.snapshot()
+        raise HTTPException(
+            503, f"审批链路不可用(长连接 state={st['state']}, crashes={st['crashes']}, "
+                 f"err={st['last_error']}) —— 拒绝受理:此时建审批实例只会静默积压。"
+                 f"请查进程日志 '[ws][down]' 或 GET /readyz")
 
     # 动态审批人 = 审批群当前成员(或签,任一通过即可)。不在群里=不是审批人=批不了。
     # 审批定义的审批节点是「自选/Free」,审批人在这里实时传入,跟随群成员增减。
