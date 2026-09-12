@@ -1,0 +1,156 @@
+# AI PR 审计（软模式：只报告，不阻断）
+# 跑在组织自建 runner qa16 上，审计工具在该机 /opt/ai-review/ci_pr_review.py。
+# 自建 runner 不消耗 Actions 额度，也没有 per-minute 费用。
+#
+# 要改成硬阻断需要两步：① 组织升级到 GitHub Team（Free 的私有仓库拿不到
+# required status checks，已实证 403）② 把本文件末尾 BLOCKING 改成 true 并在
+# 分支保护里把 ai-pr-review 设为必需检查。
+name: AI PR Review
+
+on:
+  pull_request:
+    # 必须显式列出 edited：默认活动类型只有 opened/synchronize/reopened，
+    # 而"在 PR 描述里写 AI-REVIEW-OVERRIDE"属于 edited。不加这一行，
+    # 唯一的放行通道就是个假通道——写了也不会触发运行、override 从不被读到，
+    # 失败的检查继续挂着且界面上毫无提示。（本工具自己审出来的）
+    types: [opened, synchronize, reopened, edited]
+
+# 同一 PR 连续 push 只跑最后一次，省 DeepSeek 费用
+concurrency:
+  group: ai-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BLOCKING: 'false'          # 软模式。改 'true' 即发现问题就让 job 失败
+
+jobs:
+  # job 名会成为 required status check 的标识，必须全组织唯一，
+  # 同名 job 出现在多个 workflow 会让状态检查产生歧义并把 PR 永久卡住。
+  ai-pr-review:
+    runs-on: [self-hosted, qa16]
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # fetch-depth: 0 必须：符号扩散靠 git grep 扫全仓，浅克隆会让扩散失效
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查 override
+        id: ovr
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # 提交者判断是误报时，在 PR 描述写 AI-REVIEW-OVERRIDE: <理由> 即放行并留痕。
+          # 这条通道是给 Claude 用的：遇到误报应当反驳，而不是改代码迎合门禁。
+          if printf '%s' "$BODY" | grep -qE '^AI-REVIEW-OVERRIDE:[[:space:]]*[^[:space:]]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$BODY" | grep -E '^AI-REVIEW-OVERRIDE:' | head -1 >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::本次审计被 AI-REVIEW-OVERRIDE 跳过，理由已记入 summary"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 审计
+        if: steps.ovr.outputs.skip != 'true'
+        id: run
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          # GitHub 默认 shell 是 bash -e。审计"发现问题"时按约定返回 1，
+          # 在 set -e 下这会让整个步骤直接终止，拿不到 outputs、后续步骤全被
+          # skip（连贴评论和 infra_error 提示都不会跑）—— 首次上线就踩了这个。
+          # 所以这里自己接管退出码，并让本步骤总是成功，判定交给后面的步骤。
+          set +e
+          DIFF=/tmp/pr-${{ github.run_id }}.diff
+          RESULT=/tmp/review-${{ github.run_id }}.json
+          # 先判退出码再判是否为空：`[ ! -s ]` 只看大小，会把"git diff 失败、
+          # 什么都没写出来"和"确实没有改动"混为一谈，前者被当成 pass 就等于
+          # 给一个从未审计过的 PR 盖章通过 —— 空值不是报错。（本工具自己审出来的）
+          if ! git diff "origin/${{ github.base_ref }}...HEAD" > "$DIFF"; then
+            echo "::warning::git diff 失败，按基础设施故障处理，不判定代码"
+            echo "verdict=infra_error" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ ! -s "$DIFF" ]; then
+            # 空 diff 也必须产出 $RESULT：下游"贴评论"会无条件读它，
+            # 少这一步会让它 FileNotFoundError、job 变红且 PR 上没有任何信息，
+            # 与"软模式不阻断"的声明正好相反。（这个缺陷是本工具自己审出来的）
+            echo '{"verdict":"pass","issues":[],"context_files":[],"seconds":0,"cost_cny":0}' > "$RESULT"
+            echo "verdict=pass" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          rc=9
+          # 重试是为了把"基础设施故障"和"代码有问题"分开：
+          # 否则 DeepSeek 抖一次，Claude 会以为是自己代码写错了。
+          for i in 1 2 3; do
+            python3 /opt/ai-review/ci_pr_review.py --stdin --repo . \
+              --budget 200000 --json < "$DIFF" > "$RESULT"
+            rc=$?
+            if [ "$rc" = "0" ] || [ "$rc" = "1" ]; then break; fi
+            echo "第 $i 次调用失败（rc=$rc），15s 后重试"
+            sleep 15
+          done
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case "$rc" in
+            0) echo "verdict=pass" >> "$GITHUB_OUTPUT" ;;
+            1) echo "verdict=fail" >> "$GITHUB_OUTPUT" ;;
+            *) echo "verdict=infra_error" >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit 0
+
+      - name: 贴 PR 评论
+        if: steps.ovr.outputs.skip != 'true' && steps.run.outputs.verdict != 'infra_error'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESULT: /tmp/review-${{ github.run_id }}.json
+        run: |
+          # 消费者侧同样兜一层：审计产物缺失时安静退出，
+          # 不让"报告环节"自己变成阻断合并的故障源。
+          if [ ! -s "$RESULT" ]; then
+            echo "::warning::审计结果文件缺失，跳过评论（不判定代码）"; exit 0
+          fi
+          python3 - "$RESULT" <<'PY' > /tmp/comment-${{ github.run_id }}.md
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          if d['verdict'] == 'pass':
+              print('✅ AI 审计未发现 major/critical 缺陷')
+          else:
+              print('### ⚠️ AI 审计发现 %d 处可疑\n' % len(d['issues']))
+              for i in d['issues']:
+                  print('**[%s] `%s:%s`**\n' % (i.get('severity'), i.get('file'), i.get('line')))
+                  print('- 问题：%s' % i.get('problem'))
+                  print('- 输入：`%s`' % i.get('input'))
+                  print('- 实际：%s' % i.get('actual'))
+                  print('- 应为：%s\n' % i.get('expected'))
+              print('---')
+              print('**若判断这是误报，请勿为通过门禁而修改代码。**'
+                    '在 PR 描述加一行 `AI-REVIEW-OVERRIDE: <理由>` 即可放行，理由会留痕供人工抽查。')
+              print('\n该模型已知边界：只能核对**两侧都在本仓库里**的契约'
+                    '（事件名/字段名/配置键是否一致、投影是否漏字段、边界与契约是否相符）。'
+                    '凡结论依赖**外部程序运行时行为**的（例如某内核只读哪一层配置、'
+                    'SDK 的认证优先级），它推不出来，这类报告要重点质疑。')
+          ctx = d.get('context_files', [])
+          print('\n<sub>扩散纳入 %d 个相关文件 · %.0fs · ¥%s · 软模式不阻断合并</sub>'
+                % (len(ctx), d.get('seconds', 0), d.get('cost_cny')))
+          PY
+          cat /tmp/comment-${{ github.run_id }}.md >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file /tmp/comment-${{ github.run_id }}.md
+          rm -f /tmp/pr-${{ github.run_id }}.diff /tmp/review-${{ github.run_id }}.json \
+                /tmp/comment-${{ github.run_id }}.md
+
+      - name: 基础设施故障（不判定代码）
+        if: steps.run.outputs.verdict == 'infra_error'
+        run: |
+          echo "::error::AI 审计三次调用均失败 —— 这是基础设施问题，不代表代码有缺陷。" \
+               "请检查 DEEPSEEK_API_KEY 与 DeepSeek 可用性后重跑本 job，不要据此改代码。"
+          exit 1
+
+      - name: 门禁判定
+        if: steps.ovr.outputs.skip != 'true' && steps.run.outputs.verdict == 'fail'
+        run: |
+          if [ "$BLOCKING" = "true" ]; then
+            echo "::error::AI 审计发现 major/critical 缺陷，已阻断。详见 PR 评论。"
+            exit 1
+          fi
+          echo "::warning::AI 审计发现问题（软模式，不阻断合并）。详见 PR 评论。"
