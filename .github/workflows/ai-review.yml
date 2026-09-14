@@ -142,9 +142,19 @@ jobs:
       - name: 基础设施故障（不判定代码）
         if: steps.run.outputs.verdict == 'infra_error'
         run: |
-          echo "::error::AI 审计三次调用均失败 —— 这是基础设施问题，不代表代码有缺陷。" \
-               "请检查 DEEPSEEK_API_KEY 与 DeepSeek 可用性后重跑本 job，不要据此改代码。"
-          exit 1
+          # 基础设施故障不是代码缺陷，因此这条路径也必须受 BLOCKING 约束。
+          # 原先无条件 exit 1，绕过了"判定统一交给门禁判定步骤"的约定：软模式下
+          # DeepSeek 抖一次 job 就红，而转硬门禁后 key 漏配 / fork PR 拿不到 secret /
+          # DeepSeek 抖动都会卡住全组织所有 PR。（本工具自己审出来的；sc-clouddisk
+          # 的既有 release.yml 对 infra 失败正是 warning + exit 0）
+          MSG="AI 审计三次调用均失败 —— 这是基础设施问题，不代表代码有缺陷。请检查 DEEPSEEK_API_KEY 与 DeepSeek 可用性后重跑本 job，不要据此改代码。"
+          echo "⚠️ $MSG" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BLOCKING" = "true" ]; then
+            echo "::error::$MSG"
+            exit 1
+          fi
+          echo "::warning::$MSG（软模式，不阻断）"
+          exit 0
 
       - name: 门禁判定
         if: steps.ovr.outputs.skip != 'true' && steps.run.outputs.verdict == 'fail'
