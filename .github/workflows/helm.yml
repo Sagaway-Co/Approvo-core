@@ -35,4 +35,5 @@ jobs:
         with:
           name: helm-chart
           path: dist/*.tgz
-          retention-days: 30
+          # GitHub 托管 runner 留不住本机文件，只能传 artifact：只留 1 天（owner 2026-10-20，组织 artifact 配额）。
+          retention-days: 1
