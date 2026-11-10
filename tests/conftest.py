@@ -10,6 +10,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 
+# 套件以【默认模式(飞书)】import app.settings;slack 路径由各用例 monkeypatch 切换。
+# 不清掉的话,开发机上恰好 export 了 APPROVAL_PROVIDER=slack 会让整套用例换了语义。
+os.environ.pop("APPROVAL_PROVIDER", None)
 os.environ.setdefault("FEISHU_APP_ID", "cli_test")
 os.environ.setdefault("FEISHU_APP_SECRET", "test-secret")
 # 用仓内示例配置，绝对路径 —— 不依赖 pytest 从哪个 cwd 启动

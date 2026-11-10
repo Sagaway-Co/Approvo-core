@@ -80,6 +80,43 @@ def test_try_claim_is_atomic_under_concurrency(store):
     assert store.get("ic-race")["status"] == "deploying"
 
 
+def test_approve_and_reject_race_only_one_wins(store):
+    """🔴 Slack 的「批准」「拒绝」是同一条消息上的两个按钮,可以被两个人同时点。
+
+    批准走 try_claim_for_deploy,拒绝走 try_transition —— 两条 CAS 落在同一行上,
+    只能有一个生效;否则会出现"界面显示已拒绝、部署却在跑"。
+    """
+    def race(ic: str) -> list[str]:
+        results, lock = [], threading.Lock()
+
+        def decide(kind: str):
+            ok = (store.try_claim_for_deploy(ic) if kind == "approve"
+                  else store.try_transition(ic, "pending", "rejected"))
+            with lock:
+                results.append((kind, ok))
+
+        ts = [threading.Thread(target=decide, args=(k,)) for k in ("approve", "reject") * 5]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return [k for k, ok in results if ok]
+
+    for i in range(10):                     # 多跑几轮,让交错更有机会出现
+        ic = f"ic-ar-{i}"
+        store.save(ic, _spec(tag=f"V{i}"))
+        winners = race(ic)
+        assert len(winners) == 1, f"第 {i} 轮生效了 {len(winners)} 个决策: {winners}"
+        assert store.get(ic)["status"] == {"approve": "deploying", "reject": "rejected"}[winners[0]]
+
+
+def test_try_transition_requires_expected_status(store):
+    store.save("ic-t", _spec(), status="deploying")
+    assert store.try_transition("ic-t", "pending", "rejected") is False, "不得覆盖已被认领的记录"
+    assert store.get("ic-t")["status"] == "deploying"
+    assert store.try_transition("不存在", "pending", "rejected") is False
+
+
 def test_claim_rejects_non_pending(store):
     store.save("ic-2", _spec(), status="success")
     assert store.try_claim_for_deploy("ic-2") is False
