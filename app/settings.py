@@ -11,8 +11,20 @@ import yaml
 
 CN_TZ = ZoneInfo("Asia/Shanghai")   # 所有展示时间用上海时区(容器默认 UTC)
 
-APP_ID = os.environ["FEISHU_APP_ID"]
-APP_SECRET = os.environ["FEISHU_APP_SECRET"]
+# 审批平台。feishu(默认)/ slack。
+# 🔴 未知取值直接拒绝启动(fail-close):拼错成 "slak" 若被当成默认的 feishu,
+#    进程会带着一套根本不是你想要的审批链路起来,而且看起来一切正常。
+APPROVAL_PROVIDER = os.environ.get("APPROVAL_PROVIDER", "").strip().lower() or "feishu"
+if APPROVAL_PROVIDER not in ("feishu", "slack"):
+    raise ValueError(f"APPROVAL_PROVIDER 无效: '{APPROVAL_PROVIDER}';支持 feishu / slack")
+
+if APPROVAL_PROVIDER == "feishu":
+    APP_ID = os.environ["FEISHU_APP_ID"]
+    APP_SECRET = os.environ["FEISHU_APP_SECRET"]
+else:
+    # slack 模式不要求任何飞书配置;飞书专属端点在 slack 模式下一律 501(见 server._feishu_only)
+    APP_ID = os.environ.get("FEISHU_APP_ID", "")
+    APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 
 # 飞书(国内) vs Lark(海外) endpoint. 取值:
 #   "feishu" (默认)  -> https://open.feishu.cn
@@ -53,14 +65,14 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 
 DEFAULT_PROJECT = CFG.get("default_project", "")   # 卡片标题前缀; release/req 可覆盖
 
-_f = CFG["feishu"]
+_f = CFG["feishu"] if APPROVAL_PROVIDER == "feishu" else (CFG.get("feishu") or {})
 # 两种方式配审批定义(至少一个):
 #   1) approval_code: <str>          - 单定义,所有 stage 共用(小团队/简单场景)
 #   2) approval_codes: {stage: code} - 按 stage 分派 (pre/release/hotfix 用不同审批人)
 #      未匹配的 stage 会 fallback 到 approval_codes.default 或 approval_code
 APPROVAL_CODE = _f.get("approval_code")
 APPROVAL_CODES = _f.get("approval_codes") or {}
-if not (APPROVAL_CODE or APPROVAL_CODES):
+if APPROVAL_PROVIDER == "feishu" and not (APPROVAL_CODE or APPROVAL_CODES):
     raise RuntimeError("feishu.approval_code 或 feishu.approval_codes 至少配一个")
 
 
@@ -143,3 +155,117 @@ DEPLOY_TARGETS: list = CFG.get("deploy_targets") or []
 # 未在某个 secret target 上指定 release_key 时用它(要在 releases 里有同名条目)。
 SECRET_RELEASE_KEY = CFG.get("secret_release_key", "my-secret")
 RELEASES = CFG["releases"]           # repo -> 部署目标
+
+# ── Slack 审批(APPROVAL_PROVIDER=slack)────────────────────────────────
+# 凭据【只】从环境变量读(不进 config.yaml / git):
+#   SLACK_BOT_TOKEN  xoxb-…  Web API:发/改审批消息、查频道成员、查用户
+#   SLACK_APP_TOKEN  xapp-…  Socket Mode 建连(connections:write);只出站 WSS,无需公网回调地址
+# 业务配置走 config.yaml 的 `slack:` 段(见 docs/CONFIGURATION.md / docs/SLACK.md)。
+# 🔴 slack 模式下这里任何一项缺失或不合法都【拒绝启动】(fail-close):
+#    带着一个发不出消息 / 认不出审批人的配置跑起来,比起不来更难发现。
+# 飞书模式下 `slack:` 段一律不读、不校验 —— 两种模式互不要求对方的配置。
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "").strip()
+
+# 只认 ID,不认 "#频道名" / "@用户名":改名不改 ID,而按名字匹配的鉴权一改名就漂移。
+SLACK_CHANNEL_ID_RE = re.compile(r"[CG][A-Z0-9]{6,}")
+SLACK_USER_ID_RE = re.compile(r"[UW][A-Z0-9]{6,}")
+
+SLACK_APPROVAL_CHANNEL = ""     # 审批频道 ID:审批消息发这里;审批人 = 该频道【当前】成员
+SLACK_RESULT_CHANNEL = ""       # 结果频道 ID:部署中 / 结果 / 拒绝通知;缺省 = 审批频道
+SLACK_USER_MAP: dict = {}       # github 登录名(小写) -> {"user_id": "U…", "name": "…"}
+SLACK_FORBID_SELF_APPROVAL = True   # 禁止自批(默认开)。策略见 app/providers/slack/approval.py
+SLACK_APPROVERS: dict = {}      # stage -> [U…];配了就必须同时满足(default 键兜底未列出的 stage)
+
+
+def _slack_user_id(v, where: str) -> str:
+    s = str(v or "").strip()
+    if not SLACK_USER_ID_RE.fullmatch(s):
+        raise RuntimeError(f"{where}: '{s}' 不是 Slack user ID(形如 U0XXXXXXX)")
+    return s
+
+
+def _slack_channel_id(v, where: str) -> str:
+    s = str(v or "").strip()
+    if not SLACK_CHANNEL_ID_RE.fullmatch(s):
+        raise RuntimeError(f"{where}: '{s}' 不是 Slack 频道 ID(形如 C0XXXXXXX;不接受 #频道名)")
+    return s
+
+
+def _slack_user_map(raw) -> dict:
+    """github 登录名 → Slack 用户。两种写法(同 feishu.user_map):
+         alice: "U0XXXXXXX"
+         bob:   {user_id: "U0YYYYYYY", name: "Bob"}
+    键统一转小写:GitHub 登录名大小写不敏感,而 `github.actor` 给的大小写未必与配置一致。
+    """
+    if not isinstance(raw, dict):
+        raise TypeError("slack.user_map 必须是 {github 登录名: Slack user ID | {user_id, name}}")
+    out: dict = {}
+    for login, val in raw.items():
+        key = str(login).strip().lower()
+        if not key:
+            raise RuntimeError("slack.user_map 里有空的 github 登录名")
+        if key in out:
+            # 只差大小写的两条映射到底以哪条为准?不猜,让人改配置。
+            raise RuntimeError(f"slack.user_map 里 '{login}' 与另一条只差大小写,无法判定以哪条为准")
+        if isinstance(val, dict):
+            uid, name = val.get("user_id"), str(val.get("name") or "")
+        else:
+            uid, name = val, ""
+        out[key] = {"user_id": _slack_user_id(uid, f"slack.user_map.{login}"), "name": name}
+    return out
+
+
+def _slack_approvers(raw) -> dict:
+    """stage -> 审批人白名单。🔴 写了就必须是非空列表:
+    空列表 = 该 stage 谁都批不了,这几乎总是配置写错,而不是本意 —— 起不来比卡住发版更早暴露。
+    """
+    if not isinstance(raw, dict):
+        raise TypeError("slack.approvers 必须是 {stage: [Slack user ID, ...]}")
+    out: dict = {}
+    for stage, ids in raw.items():
+        if not isinstance(ids, list) or not ids:
+            raise RuntimeError(f"slack.approvers.{stage} 必须是非空的 Slack user ID 列表")
+        out[str(stage)] = [_slack_user_id(u, f"slack.approvers.{stage}") for u in ids]
+    return out
+
+
+if APPROVAL_PROVIDER == "slack":
+    if not SLACK_BOT_TOKEN:
+        raise RuntimeError("APPROVAL_PROVIDER=slack 但缺少环境变量 SLACK_BOT_TOKEN(xoxb-…)")
+    if not SLACK_BOT_TOKEN.startswith("xoxb-"):
+        # 🔴 不回显 token 本身(哪怕前几位)—— 启动日志会被收集、转发、截图
+        raise RuntimeError("SLACK_BOT_TOKEN 必须是 bot token(xoxb- 开头);user token(xoxp-)权限过大且绑定个人")
+    if not SLACK_APP_TOKEN:
+        raise RuntimeError("APPROVAL_PROVIDER=slack 但缺少环境变量 SLACK_APP_TOKEN"
+                           "(xapp-…,需 connections:write,Socket Mode 用)")
+    if not SLACK_APP_TOKEN.startswith("xapp-"):
+        raise RuntimeError("SLACK_APP_TOKEN 必须是 app-level token(xapp- 开头)")
+    _s = CFG.get("slack")
+    if not isinstance(_s, dict):
+        raise RuntimeError("APPROVAL_PROVIDER=slack 但 config.yaml 缺少 `slack:` 段")
+    SLACK_APPROVAL_CHANNEL = _slack_channel_id(_s.get("approval_channel"), "slack.approval_channel")
+    SLACK_RESULT_CHANNEL = (_slack_channel_id(_s["result_channel"], "slack.result_channel")
+                            if _s.get("result_channel") else SLACK_APPROVAL_CHANNEL)
+    SLACK_USER_MAP = _slack_user_map(_s.get("user_map") or {})
+    _fsa = _s.get("forbid_self_approval", True)
+    if not isinstance(_fsa, bool):
+        # 🔴 "false"(字符串)在 Python 里是真值:按 bool() 转会和写的人想的正相反。只认 YAML 布尔。
+        raise RuntimeError("slack.forbid_self_approval 必须是布尔值 true / false(不要加引号)")
+    SLACK_FORBID_SELF_APPROVAL = _fsa
+    SLACK_APPROVERS = _slack_approvers(_s.get("approvers") or {})
+
+
+def slack_approvers_for(stage: str | None) -> set | None:
+    """该 stage 的审批人白名单;None = 未限定(只看频道成员 + 自批规则)。
+
+    与 approval_code_for 同一套回落规则:stage 自己的条目 > `default` 条目 > 不限定。
+    ⚠️ 按 stage 取值意味着【请求里的 stage 决定适用哪份白名单】。声明了 stages 的应用,
+    未登记的 stage 会被 /release 直接 400;未声明 stages 的应用请配 `default`,
+    否则不带 stage 的请求就不受任何白名单约束。
+    """
+    if stage and stage in SLACK_APPROVERS:
+        return set(SLACK_APPROVERS[stage])
+    if "default" in SLACK_APPROVERS:
+        return set(SLACK_APPROVERS["default"])
+    return None

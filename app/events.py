@@ -51,21 +51,41 @@ def _safe_card(card, what: str):
         print(f"[deploy][warn] 发送{what}卡片失败(不影响部署): {type(e).__name__}: {e}")
 
 
+def _notify_deploying(spec: dict, approver_name) -> None:
+    """「部署中」通知,按审批平台分发。两条路都【不上抛】(理由见 _safe_card)。"""
+    if settings.APPROVAL_PROVIDER == "slack":
+        from app.providers.slack import messaging  # 延迟导入:飞书模式不加载 Slack 依赖
+        messaging.notify_deploying(spec, approver_name, _now())
+        return
+    _safe_card(cards.deploying_card(spec, approver_name=approver_name, when=_now()), "部署中")
+
+
+def _notify_result(spec: dict, ok: bool, approver_name, log) -> None:
+    if settings.APPROVAL_PROVIDER == "slack":
+        from app.providers.slack import messaging
+        messaging.notify_result(spec, ok, approver_name, _now(), log)
+        return
+    _safe_card(cards.result_card(spec, ok=ok, approver_name=approver_name, when=_now(), log=log), "结果")
+
+
 def _run_deploy(instance_code: str, spec: dict, approver_name):
     """在独立线程跑:先弹"部署中",再部署(github 方式会等 run 跑完),最后弹结果。
 
     🔴 整个函数体必须被 try/except 包住:它跑在 daemon 线程里,未捕获异常只会往 stderr
     打一段 traceback,不会有人看见 —— 表现为"批了却没上线"。任何异常都必须落库成
     failed 并告警,让它可见、可重发。
+
+    飞书审批、审批直通、Slack 审批共用这一个函数 —— 部署逻辑只有一份,
+    差别只在通知发到哪个平台(_notify_*)。
     """
-    _safe_card(cards.deploying_card(spec, approver_name=approver_name, when=_now()), "部署中")
+    _notify_deploying(spec, approver_name)
     try:
         ok, log = get_deployer(spec.get("method", "kubectl")).deploy(spec)
     except Exception as e:  # 兜底:部署器任何异常都要可见(BLE001 已在 ruff.toml 全局 ignore)
         ok, log = False, f"部署异常({type(e).__name__}): {e}"
         traceback.print_exc()
     store.set_status(instance_code, "success" if ok else "failed")
-    _safe_card(cards.result_card(spec, ok=ok, approver_name=approver_name, when=_now(), log=log), "结果")
+    _notify_result(spec, ok, approver_name, log)
     print(f"[deploy] {spec['repo']}:{spec['tag']} -> {'OK' if ok else 'FAIL'}")
 
 

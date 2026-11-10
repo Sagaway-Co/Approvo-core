@@ -1,6 +1,8 @@
 """HTTP 接口:CI 打 tag 后 POST /release,创建飞书审批实例并落库。
 
 审批通过/拒绝由长连接事件驱动(见 events.py),不在这里处理。
+APPROVAL_PROVIDER=slack 时改为在 Slack 审批频道发 Block Kit 审批消息,
+按钮点击经 Socket Mode 处理(见 app/providers/slack/)。
 """
 import hashlib
 import json
@@ -126,6 +128,20 @@ def _check_release_token(x_release_token: str) -> None:
     raise HTTPException(401, "bad release token")
 
 
+def _feishu_only(feature: str) -> None:
+    """飞书专属能力在 slack 模式下【明确】返回 501,而不是静默出错。
+
+    🔴 这些端点的身份校验建立在飞书群成员 / 飞书 user_id / 飞书机器人菜单上。
+       slack 模式下没有飞书凭据:若照常往下走,要么在半路抛一个看不懂的 500,
+       要么(更糟)某个"查成员失败就当没人"的分支把请求当成合法的放过去。
+       不支持就说不支持 —— 调用方拿到 501 + 原因,一眼知道该换哪条路。
+    """
+    if settings.APPROVAL_PROVIDER != "feishu":
+        raise HTTPException(
+            501, f"{feature} 目前仅飞书模式支持(当前 APPROVAL_PROVIDER={settings.APPROVAL_PROVIDER})"
+                 f"。与 IM 无关的通道(如 /deploy-credential)不受影响")
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """深度合并 override 到 base:dict 递归合并,其他类型 override 胜。
 
@@ -176,7 +192,11 @@ def healthz():
     故:存活与"能力可用"分开两个端点,body 里把真实状态如实带出来。
     要做能力告警请用 /readyz(见下)。
     """
-    return {"ok": True, "ws": wshealth.snapshot()}
+    body = {"ok": True, "ws": wshealth.snapshot()}
+    if settings.APPROVAL_PROVIDER != "feishu":
+        # 只在非默认平台时附带:飞书模式的响应体保持逐字节不变
+        body["provider"] = settings.APPROVAL_PROVIDER
+    return body
 
 
 @app.get("/readyz")
@@ -321,6 +341,30 @@ def _bypass_release(instance_code: str, spec: dict, env: str | None) -> dict:
             "note": "审批直通已开启:生产不自动发版,已落库并置 failed,请人工执行后自行确认"}
 
 
+def _slack_submit(spec: dict) -> dict:
+    """slack 模式的受理:落库(pending)→ 在审批频道发 Block Kit 审批消息。
+
+    🔴 先落库、再发消息:消息一出现就可能被点 —— 顺序反过来,最快的那一下点击会扑空。
+    🔴 发消息失败 → 置 failed 并 502:不留一条"没人看得见、也就永远不会被批"的 pending
+       (那就是静默积压,CI 却拿到了 2xx)。置 failed 而非删除:留痕,且防重检查允许直接重试。
+    """
+    from app.providers.slack import approval as slack_approval
+    from app.providers.slack import messaging
+    instance_code = slack_approval.new_instance_code()
+    store.save(instance_code, spec)
+    try:
+        messaging.post_approval(instance_code, spec)
+    except Exception as e:  # 任何发送失败都要让 CI 当场红(BLE001 已在 ruff.toml 全局 ignore)
+        store.set_status(instance_code, "failed")
+        print(f"[slack][error] 审批消息发送失败 instance={instance_code}: {type(e).__name__}: {e}")
+        raise HTTPException(502, f"Slack 审批消息发送失败(本次已置 failed,可直接重试): "
+                                 f"{type(e).__name__}: {e}")
+    print(f"[slack][submit] instance={instance_code} {spec['repo']}:{spec['tag']} "
+          f"stage={spec.get('stage')} applicant={spec.get('slack_applicant_ids') or '未映射'}")
+    return {"instance_code": instance_code, "repo": spec["repo"], "tag": spec["tag"],
+            "image": spec["image"]}
+
+
 @app.post("/release")
 def release(req: ReleaseReq, x_release_token: str = Header(default="")):
     _check_release_token(x_release_token)
@@ -372,17 +416,28 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
 
     g = rel.get("github") or {}
 
-    # 解析申请人:github 用户名 → 映射表(取 open_id + 真名)> 显式 user_id > 邮箱反查 > 兜底
-    row = store.usermap_get_row(req.github_actor) if req.github_actor else None
-    initiator = req.operator_user_id or (row["user_id"] if row else None)
-    if not initiator and req.operator_email:
-        initiator = feishu.user_id_by_email(req.operator_email)
-    initiator = initiator or settings.DEFAULT_INITIATOR
-    if not initiator:
-        raise HTTPException(400, "无法确定申请人(在 /admin 配 github 映射,或设 default_initiator_user_id)")
+    if settings.APPROVAL_PROVIDER == "slack":
+        # 延迟导入:飞书模式不加载 Slack 依赖链(同 _bypass_release 的做法)
+        from app.providers.slack import approval as slack_approval
+        # 申请人 → Slack 用户:config 的 slack.user_map ∪ operator_user_id ∪ 邮箱反查(取并集)。
+        # 🔴 映射不出来【不拒绝受理】,也【不】用任何兜底申请人顶替 —— 顶替会让自批检查
+        #    比对一个错的人。能不能批由审批时的自批策略决定(fail-close),消息上明示"未映射"。
+        applicant = slack_approval.resolve_applicant(
+            req.github_actor, req.operator_email, req.operator_user_id)
+        initiator = applicant["primary"]
+        mapped_name = applicant["name"]
+    else:
+        # 解析申请人:github 用户名 → 映射表(取 open_id + 真名)> 显式 user_id > 邮箱反查 > 兜底
+        row = store.usermap_get_row(req.github_actor) if req.github_actor else None
+        initiator = req.operator_user_id or (row["user_id"] if row else None)
+        if not initiator and req.operator_email:
+            initiator = feishu.user_id_by_email(req.operator_email)
+        initiator = initiator or settings.DEFAULT_INITIATOR
+        if not initiator:
+            raise HTTPException(400, "无法确定申请人(在 /admin 配 github 映射,或设 default_initiator_user_id)")
+        mapped_name = (row and row.get("name")) or ""
 
     # 名字优先级: 映射真名 > 邮箱 > GitHub 名 > 兜底
-    mapped_name = (row and row.get("name")) or ""
     operator_name = mapped_name or req.operator_email or req.github_actor or "-"
 
     platform = rel.get("platform", "-")              # 部署目标:海外 / 国内
@@ -425,6 +480,9 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
         "changes": _collect_changes(rel, req, head_commit),
         "db_changes": _collect_db_changes(rel, req),
     }
+    if settings.APPROVAL_PROVIDER == "slack":
+        # 自批判定的依据随记录落库:点击可能发生在几小时后、甚至重启之后
+        spec["slack_applicant_ids"] = applicant["ids"]
 
     # 审批定义表单复用现有 8 控件：部署目标必须让审批人看得见。
     # GitHub 方式的真实部署目标在 rel["deploy"]，改前是用 owner/repo 塞进"集群"位，
@@ -493,6 +551,9 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
                  f"err={st['last_error']}) —— 拒绝受理:此时建审批实例只会静默积压。"
                  f"请查进程日志 '[ws][down]' 或 GET /readyz")
 
+    if settings.APPROVAL_PROVIDER == "slack":
+        return _slack_submit(spec)
+
     # 动态审批人 = 审批群当前成员(或签,任一通过即可)。不在群里=不是审批人=批不了。
     # 审批定义的审批节点是「自选/Free」,审批人在这里实时传入,跟随群成员增减。
     approvers = feishu.get_chat_members(settings.DETAIL_CHAT_ID)
@@ -518,13 +579,19 @@ class UserMapReq(BaseModel):
     name: str | None = ""
 
 
+_ADMIN_MAP_FEATURE = ("申请人映射管理(/admin、/api/usermap、/api/resolve;"
+                      "slack 模式的映射在 config.yaml 的 slack.user_map,改动走 git 审查)")
+
+
 @app.get("/api/usermap")
 def api_usermap_list(_: str = Depends(require_admin)):
+    _feishu_only(_ADMIN_MAP_FEATURE)
     return store.usermap_list()
 
 
 @app.post("/api/usermap")
 def api_usermap_set(req: UserMapReq, _: str = Depends(require_admin)):
+    _feishu_only(_ADMIN_MAP_FEATURE)
     gh, uid = req.github_login.strip(), req.user_id.strip()
     if not gh or not uid:
         raise HTTPException(400, "github_login 和 user_id 必填")
@@ -534,17 +601,20 @@ def api_usermap_set(req: UserMapReq, _: str = Depends(require_admin)):
 
 @app.delete("/api/usermap/{github_login}")
 def api_usermap_delete(github_login: str, _: str = Depends(require_admin)):
+    _feishu_only(_ADMIN_MAP_FEATURE)
     return {"ok": store.usermap_delete(github_login)}
 
 
 @app.get("/api/resolve")
 def api_resolve(email: str, _: str = Depends(require_admin)):
     """邮箱反查飞书 user_id,方便填表。"""
+    _feishu_only(_ADMIN_MAP_FEATURE)
     return {"email": email, "user_id": feishu.user_id_by_email(email)}
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_: str = Depends(require_admin)):
+    _feishu_only(_ADMIN_MAP_FEATURE)
     return ADMIN_HTML
 
 
@@ -638,6 +708,7 @@ def viewer_token(req: ViewerTokenReq, x_release_token: str = Header(default=""))
     只读 + 30 分钟 + 全群可见，比"批一次然后没人记得"更有威慑，且不会因为
     "查个日志还要等审批"把人逼回去 ssh。
     """
+    _feishu_only("只读凭证签发(/viewer-token,身份校验依赖飞书审批群成员)")
     _check_release_token(x_release_token)
     if not _rate_ok("viewer_token"):
         raise HTTPException(429, "too many requests")
@@ -772,6 +843,7 @@ def release_key(req: ReleaseKeyReq):
     #    用户的有效凭证就被白白烧掉了。代价是无效 grant 也占本端点额度 ——
     #    但本端点无预先凭证可校验,无法在兑换前区分攻击者与正常人;
     #    独立分桶已保证最坏情况只影响 /release-key 自己,不再连坐其它端点。
+    _feishu_only("发版密钥兑换(/release-key,兑换券只能由飞书机器人菜单签发)")
     if not _rate_ok("release_key"):
         raise HTTPException(429, "too many requests")
     ok, name, err = keygrant.redeem(req.grant)
@@ -795,6 +867,7 @@ def viewer_panel(_: str = Depends(require_admin)):
     按钮、按钮指向哪个集群/namespace。若用共享的 RELEASE_TOKEN，任何能发版的 CI
     都能往群里投一张"看起来正规"的卡片，把人骗去点。发卡权必须比用卡权更严。
     """
+    _feishu_only("只读凭证面板(/viewer-panel,飞书卡片)")
     targets = settings.VIEWER_TARGETS
     if not targets:
         # 🔴 不配就报错，而不是发一张没有按钮的空卡（空卡看起来像成功）
@@ -834,6 +907,7 @@ class SecretCommitReq(BaseModel):
 @app.post("/secret/request")
 def secret_request(req: SecretRequestReq, x_release_token: str = Header(default="")):
     """第一步：申请「允许改某个 Secret 的某个 key」。值不在此提交。"""
+    _feishu_only("Secret 变更申请(/secret/request,身份校验依赖飞书审批群成员)")
     _check_release_token(x_release_token)
     if not _rate_ok("secret_request"):
         raise HTTPException(429, "too many requests")
@@ -882,6 +956,7 @@ def secret_request(req: SecretRequestReq, x_release_token: str = Header(default=
 @app.post("/secret/commit")
 def secret_commit(req: SecretCommitReq, x_release_token: str = Header(default="")):
     """第二步：授权生效后提交值，直接写入集群。值只在内存中过一遍。"""
+    _feishu_only("Secret 变更提交(/secret/commit)")
     # 🔴 本端点原先【完全没有限流】,而它恰恰是直接写集群的那一步 —— 补上,独立分桶。
     _check_release_token(x_release_token)
     if not _rate_ok("secret_commit"):
