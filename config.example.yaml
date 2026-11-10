@@ -1,6 +1,7 @@
 # approvo · 示例配置
 # 复制成 config.yaml 后按需修改。密钥走环境变量,不要写在这里(见 docs/CONFIGURATION.md)。
 # 飞书(国内)用户可跳过 LARK_ENDPOINT (默认 feishu);Lark(海外)用户需 export LARK_ENDPOINT=lark。
+# 审批平台由环境变量 APPROVAL_PROVIDER 选:feishu(默认,读下面的 feishu: 段)/ slack(读 slack: 段)。
 
 # 项目名前缀 (可选) - 显示在所有卡片标题最前面,方便多项目审批时一眼分辨.
 # 顶层默认,可被 release.project 或 POST /release body.project 覆盖.
@@ -31,6 +32,23 @@ feishu:
   # form_field_ids:
   #   repo: "widget16xxxxxxx"
   #   tag:  "widget16yyyyyyy"
+
+# ── Slack 审批(APPROVAL_PROVIDER=slack 时才读这一段;飞书模式完全不读)──
+# Slack App 的建法、5 个 bot scope、两个 token 见 docs/SLACK.md。
+# token 只走环境变量 SLACK_BOT_TOKEN(xoxb-…)/ SLACK_APP_TOKEN(xapp-…),不要写在这里。
+# slack 模式下上面的 feishu: 段可以整段删掉。
+# slack:
+#   approval_channel: "C0XXXXXXX"              # 审批频道 ID(不是 #名字);审批人 = 该频道【当前】成员
+#   result_channel: "C0YYYYYYY"                # 结果频道 ID;省略 = 审批频道
+#   forbid_self_approval: true                 # 禁止自批(默认 true;只认 YAML 布尔)
+#   user_map:                                  # GitHub 登录名 → Slack 用户(申请人映射 + 已登记审批人)
+#     alice: "U0XXXXXXX"
+#     bob:
+#       user_id: "U0YYYYYYY"
+#       name: "Bob"
+#   approvers:                                 # 可选:按 stage 限定审批人,配了就必须同时满足
+#     release: ["U0XXXXXXX"]
+#     # default: ["U0XXXXXXX"]                 # 未单列的 stage 用它
 
 clusters:                                     # 供 method=kubectl / helm 使用;method=github 不需要
   primary:

@@ -6,8 +6,11 @@ approvo 配置分两层:**环境变量** (敏感凭证) + **config.yaml** (业�
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `FEISHU_APP_ID` | ✓ | 自建应用 App ID (`cli_xxx`);Lark 版格式相同 |
-| `FEISHU_APP_SECRET` | ✓ | 自建应用 App Secret |
+| `APPROVAL_PROVIDER` |    | 审批平台:`feishu`(默认)/ `slack`;其它取值**拒绝启动**。两种模式互不要求对方的配置 |
+| `FEISHU_APP_ID` | ✓ (feishu) | 自建应用 App ID (`cli_xxx`);Lark 版格式相同。slack 模式不需要 |
+| `FEISHU_APP_SECRET` | ✓ (feishu) | 自建应用 App Secret。slack 模式不需要 |
+| `SLACK_BOT_TOKEN` | ✓ (slack) | Bot User OAuth Token(`xoxb-...`);缺失或前缀不对**拒绝启动**。见 [SLACK.md](SLACK.md) |
+| `SLACK_APP_TOKEN` | ✓ (slack) | App-Level Token(`xapp-...`,scope `connections:write`),Socket Mode 建连用;缺失或前缀不对**拒绝启动** |
 | `LARK_ENDPOINT` |    | `feishu` (默认, `open.feishu.cn`) / `lark` (`open.larksuite.com`) / 完整 URL (私有部署);决定 SDK 长连接 + REST API 走哪个 domain |
 | `RELEASE_TOKEN` |    | `/release` 接口共享密钥;留空=不校验 (仅内网可接受) |
 | `ADMIN_USER` |     | `/admin` 页 Basic Auth 用户名,默认 `admin` |
@@ -83,13 +86,48 @@ kubectl -n approvo logs deploy/approvo | grep 审批直通
 ⚠️ 用 `kubectl set env` 打的环境变量**不在 chart 里**,下一次 `helm upgrade` 会把它冲掉
 (对这个开关而言,"被冲掉"= 回到需审批,是安全的那一侧)。
 
+## Slack 审批 (APPROVAL_PROVIDER=slack)
+
+Slack App 怎么建、要哪 5 个 scope、两个 token 从哪拿,见 [SLACK.md](SLACK.md)。config.yaml 里加 `slack:` 段
+(`feishu:` 段在 slack 模式下不需要,有也不读):
+
+```yaml
+slack:
+  approval_channel: "C0XXXXXXX"     # 必填。审批频道 ID;审批人 = 该频道【当前】成员
+  result_channel: "C0YYYYYYY"       # 可选。部署中 / 结果 / 拒绝通知发这里;缺省 = 审批频道
+  forbid_self_approval: true        # 可选,默认 true。只认 YAML 布尔(写成 "false" 字符串会拒绝启动)
+  user_map:                         # GitHub 登录名(大小写不敏感)→ Slack 用户
+    alice: "U0XXXXXXX"
+    bob: {user_id: "U0YYYYYYY", name: "Bob"}
+  approvers:                        # 可选。按 stage 的审批人白名单,配了就必须与"频道成员"同时满足
+    release: ["U0XXXXXXX", "U0ZZZZZZZ"]
+    default: ["U0XXXXXXX"]          # 未单列的 stage(含不带 stage 的请求)用它;不写则这些 stage 不限定
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `approval_channel` | 只认频道 ID(`C…` / `G…`),不认 `#频道名`。机器人必须在频道里;不能是 Slack Connect 外部共享频道 |
+| `result_channel` | 同上;缺省等于审批频道 |
+| `forbid_self_approval` | 禁止申请人批准自己的申请(默认开)。申请人映射不出来时的 fail-close 策略见 [SLACK.md](SLACK.md#申请人怎么映射映射不出来怎么办) |
+| `user_map` | 申请人映射 + "已登记审批人"名单。**只在 config 里维护**(改动走 git 审查、重启生效),slack 模式下 `/admin` 映射页返回 501 —— 映射直接决定自批判定,不该能被一个 Basic Auth 口令热改 |
+| `approvers` | `stage → [user ID]`,非空列表。与飞书 `approval_codes` 同一套回落:stage 自己的条目 > `default` > 不限定 |
+
+申请人的 Slack 身份取 `user_map[github_actor]`、请求里的 `operator_user_id`(须是 Slack user ID)、
+`users.lookupByEmail(operator_email)` 三者的**并集**;`feishu.default_initiator_user_id` 这类"兜底申请人"
+在 slack 模式下**刻意没有** —— 顶替一个错的申请人,会让自批检查去比对一个错的人。
+
+slack 模式下返回 **501** 的端点(依赖飞书身份):`/viewer-token`、`/viewer-panel`、`/secret/request`、
+`/secret/commit`、`/release-key`、`/admin`、`/api/usermap`、`/api/resolve`。
+`/release`、`/healthz`、`/readyz`、`/deploy-credential`(+`/revoke`)、`APPROVAL_BYPASS` 照常工作
+(`/healthz` 在 slack 模式下多一个 `"provider": "slack"` 字段)。
+
 ## config.yaml
 
 ```yaml
 default_project: "MyProject"                # (可选) 卡片标题前缀,如 "MyProject · 发版申请 · 待审批"
                                             # 优先级: POST body.project > release.project > default_project
 
-feishu:
+feishu:                                     # APPROVAL_PROVIDER=feishu(默认)时必填;slack 模式不读
   # 审批定义 - approval_code 与 approval_codes 二选一 (或都配, codes 优先):
   approval_code: "<UUID>"                   # (A) 单定义, 所有 stage 共用
   approval_codes:                           # (B) 按 stage 分派 - 推荐生产
@@ -111,6 +149,10 @@ feishu:
     repo: "widget_xxx"
     tag:  "widget_yyy"
     # ... 见 app/forms.py 的 KEYS
+
+slack:                                      # APPROVAL_PROVIDER=slack 时必填;飞书模式不读。字段见上一节
+  approval_channel: "C0XXXXXXX"
+  user_map: {}
 
 clusters:                                   # 供 method=kubectl / helm 使用
   <cluster_name>:
@@ -266,3 +308,8 @@ releases:
 - **新增端点忘了改 Ingress**:公网调用得到的 404 与"路径不存在"完全一样、无法区分。
   判据:对照 `/release`(422=能到应用)与 `/no-such-path`(404),立刻分清是哪一层
 - **飞书审批定义控件顺序变了**:approvo 按 `form_field_ids` 里的 id 匹配,和顺序无关;但控件 id 错会导致值绑不上
+- **(slack)频道写成了 `#频道名`**:只认 ID,拒绝启动。频道详情页最底部有 `Channel ID`
+- **(slack)机器人没被拉进审批 / 结果频道**:Socket Mode 照样连得上,但每次建连前的自检会失败 →
+  `/readyz` 503、`/release` 拒绝受理,日志 `[ws][down] provider=slack ... 机器人不在审批频道里`
+- **(slack)申请人没登记进 `user_map`、也没带 `operator_email`**:照常受理,但只有 `user_map` 里登记过的成员
+  能批(消息上会标「未映射」);连 `github_actor` 都没带的申请谁都批不了,只能拒绝后补全身份重提
