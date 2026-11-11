@@ -169,7 +169,16 @@ def _manifest(spec: dict) -> str | None:
     if not m:
         return None
     tag = spec.get("tag") or ""
-    lines = [f"*🧩 发布清单* {_code(m.get('path'))} @ {_code(str(m.get('commit') or '')[:12])}"]
+    blob = str(m.get("blob_base") or "")
+    base_dir = str(m.get("base_dir") or "")
+
+    def file_link(path: str, text: str | None = None) -> str:
+        """仓库内文件 → 链到 tag 对应 commit 上的该文件;拿不到链接就退化成行内代码。"""
+        return _link(f"{blob}/{path}", text or path) if blob else _code(text or path)
+
+    commit = str(m.get("commit") or "")[:12]
+    commit_s = _link(m.get("commit_url"), commit) if m.get("commit_url") else _code(commit)
+    lines = [f"*🧩 发布清单* {file_link(str(m.get('path') or ''))} @ {commit_s}"]
     svcs = m.get("services") or []
     if svcs:
         lines.append(f"*服务({len(svcs)},按此顺序发布)*")
@@ -189,7 +198,8 @@ def _manifest(spec: dict) -> str | None:
         lines.append(f"*🗄 数据库迁移({len(migs)},按此顺序执行)*")
         for g in migs[:15]:
             danger = ("  🔴 " + " / ".join(esc(x) for x in g["danger"])) if g.get("danger") else ""
-            lines.append(f"· {_code(g.get('database'))} ← {_code(g.get('file'))}{danger}")
+            full = f"{base_dir}/{g.get('file')}" if base_dir else str(g.get("file"))
+            lines.append(f"· {_code(g.get('database'))} ← {file_link(full, str(g.get('file')))}{danger}")
         if len(migs) > 15:
             lines.append(f"· …共 {len(migs)} 个迁移")
         if any(g.get("danger") for g in migs):
@@ -200,7 +210,7 @@ def _manifest(spec: dict) -> str | None:
     cms = m.get("configmaps") or []
     if cms:
         lines.append(f"*🔧 ConfigMap({len(cms)})*")
-        lines += [f"· {_code(c)}" for c in cms[:15]]
+        lines += [f"· {file_link(str(c))}" for c in cms[:15]]
     else:
         lines.append("*🔧 ConfigMap*:无")
     if m.get("notes"):

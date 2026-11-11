@@ -56,6 +56,7 @@ FILES = {
 
 @pytest.fixture()
 def gh(monkeypatch):
+    monkeypatch.setenv("GITHUB_APP_OWNER", "my-org")
     seen = []
 
     def file_at(repo, path, ref, max_bytes):
@@ -81,6 +82,30 @@ def test_manifest_is_read_at_the_tag_commit_with_registry(gh):
     assert m["services"][1] == {"name": "svc-b", "image": "svc-b-img",
                                 "deployments": ["svc-b-server", "svc-b-worker"]}
     assert m["configmaps"] == ["deploy/cm/svc-a.yaml"] and m["notes"] == "一句话说明 #123"
+
+
+def test_card_links_point_at_the_tag_commit(gh, monkeypatch):
+    """清单 / 迁移 / ConfigMap / commit 都可点,且链到 tag 对应的 commit(不是分支最新)。"""
+    monkeypatch.setenv("GITHUB_APP_OWNER", "my-org")
+    m = _read()
+    blob = f"https://github.com/my-org/my-monorepo/blob/{SHA}"
+    assert m["blob_base"] == blob and m["commit_url"] == f"https://github.com/my-org/my-monorepo/commit/{SHA}"
+    spec = {"repo": "my-monorepo", "tag": TAG, "image": "x", "submit_time": "-", "manifest": m}
+    dump = json.dumps(messaging.approval_message("slk-x", spec)[1], ensure_ascii=False)
+    assert f"<{blob}/releases/V1.2.3-release/release.yaml|releases/V1.2.3-release/release.yaml>" in dump
+    assert f"<{blob}/releases/V1.2.3-release/migrations/001_add_col.sql|migrations/001_add_col.sql>" in dump
+    assert f"<{blob}/deploy/cm/svc-a.yaml|deploy/cm/svc-a.yaml>" in dump
+    assert f"<https://github.com/my-org/my-monorepo/commit/{SHA}|{SHA[:12]}>" in dump
+    from app import cards
+    feishu = json.dumps(cards._manifest_block(spec), ensure_ascii=False)
+    assert f"]({blob}/releases/V1.2.3-release/release.yaml)" in feishu
+
+
+def test_card_without_links_falls_back_to_code():
+    m = {"status": "ok", "path": "r/x.yaml", "commit": SHA, "services": [], "migrations": [], "configmaps": ["c.yaml"]}
+    spec = {"repo": "r", "tag": TAG, "image": "x", "submit_time": "-", "manifest": m}
+    dump = json.dumps(messaging.approval_message("slk-x", spec)[1], ensure_ascii=False)
+    assert "`r/x.yaml`" in dump and "`c.yaml`" in dump and "<http" not in dump
 
 
 def test_migration_danger_is_scanned_from_file_content(gh):

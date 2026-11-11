@@ -118,7 +118,20 @@ def _manifest_block(spec: dict) -> dict | None:
     if not m:
         return None
     tag = _md_safe(spec.get("tag") or "")
-    lines = [f"**🧩 发布清单** `{_md_safe(m.get('path') or '')}` @ `{_md_safe(str(m.get('commit') or '')[:12])}`"]
+    blob = str(m.get("blob_base") or "")
+    base_dir = str(m.get("base_dir") or "")
+
+    def file_link(path: str, text: str | None = None) -> str:
+        t = _md_safe(text or path)
+        url = f"{blob}/{path}"
+        if blob.startswith("https://") and not any(c in url for c in "()<> \n"):
+            return f"[{t}]({url})"
+        return f"`{t}`"
+
+    commit = _md_safe(str(m.get("commit") or "")[:12])
+    cu = str(m.get("commit_url") or "")
+    commit_s = f"[{commit}]({cu})" if cu.startswith("https://") and not any(c in cu for c in "()<> \n") else f"`{commit}`"
+    lines = [f"**🧩 发布清单** {file_link(str(m.get('path') or ''))} @ {commit_s}"]
     svcs = m.get("services") or []
     if svcs:
         lines.append(f"**服务({len(svcs)},按此顺序发布)**")
@@ -137,13 +150,14 @@ def _manifest_block(spec: dict) -> dict | None:
         lines.append(f"**🗄 数据库迁移({len(migs)},按此顺序执行)**")
         for g in migs[:15]:
             danger = ("  🔴 " + " / ".join(g["danger"])) if g.get("danger") else ""
-            lines.append(f"· `{_md_safe(g.get('database'))}` ← `{_md_safe(g.get('file'))}`{danger}")
+            full = f"{base_dir}/{g.get('file')}" if base_dir else str(g.get("file"))
+            lines.append(f"· `{_md_safe(g.get('database'))}` ← {file_link(full, str(g.get('file')))}{danger}")
         if any(g.get("danger") for g in migs):
             lines.append("🔴 含破坏性语句 —— 镜像可回滚、schema 不可回滚,回滚镜像只会让旧代码撞上已变的表结构。")
     else:
         lines.append("**🗄 数据库迁移**:无")
     cms = m.get("configmaps") or []
-    lines.append("**🔧 ConfigMap**:" + ("无" if not cms else "\n" + "\n".join(f"· `{_md_safe(c)}`" for c in cms[:15])))
+    lines.append("**🔧 ConfigMap**:" + ("无" if not cms else "\n" + "\n".join(f"· {file_link(str(c))}" for c in cms[:15])))
     if m.get("notes"):
         lines.append(f"**说明**:{_md_safe(str(m['notes']))[:300]}")
     return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}

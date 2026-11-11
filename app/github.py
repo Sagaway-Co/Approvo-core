@@ -521,5 +521,18 @@ def release_manifest(repo: str, path_template: str, tag: str, registry: str | No
     m["services"] = [{"name": s, "image": (info.get(s) or {}).get("image"),
                       "deployments": (info.get(s) or {}).get("deployments") or []}
                      for s in m["services"]]
-    m.update(status="ok", path=path, commit=sha)
+    owner, repo_only = _split_owner_repo(repo, os.environ["GITHUB_APP_OWNER"])
+    web = f"{_web_base()}/{owner}/{repo_only}"
+    # 卡片上的清单 / 迁移 / ConfigMap / commit 都可点:链到【同一个 commit】上的文件,不是分支上的最新版
+    m.update(status="ok", path=path, commit=sha,
+             commit_url=f"{web}/commit/{sha}", blob_base=f"{web}/blob/{sha}",
+             base_dir=base)
     return m
+
+
+def _web_base() -> str:
+    """API 地址 → 网页地址:api.github.com → github.com;GHE 的 https://host/api/v3 → https://host。"""
+    api = API.rstrip("/")
+    if api == "https://api.github.com":
+        return "https://github.com"
+    return api.removesuffix("/api/v3")
