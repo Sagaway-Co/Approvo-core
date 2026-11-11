@@ -9,10 +9,11 @@ workflow_dispatch 的 token(env GITHUB_TOKEN),不持有任何 kubeconfig。
 import os
 import re
 import time
+from urllib.parse import quote
 
 import requests
 
-from app import deploycred, k8s
+from app import deploycred, k8s, manifest
 
 API = os.environ.get("GITHUB_API", "https://api.github.com")  # 自建/企业版改这里
 
@@ -466,3 +467,59 @@ def db_migration_changes(deploy_repo: str, since_iso: str | None,
                 "commits": len(commits)}
     except Exception as e:      # 查不到 ≠ 没有:必须让卡片显示"无法判定"
         return {"status": "unknown", "reason": f"{type(e).__name__}: {e}"}
+
+
+def _file_at(repo: str, path: str, ref: str, max_bytes: int) -> str | None:
+    """读仓库里某个 commit 上的文件原文;不存在返回 None。超限 / 非 UTF-8 → ManifestError。"""
+    owner, repo_only = _split_owner_repo(repo, os.environ["GITHUB_APP_OWNER"])
+    h = dict(_read_headers(repo), Accept="application/vnd.github.raw+json")
+    r = requests.get(f"{API}/repos/{owner}/{repo_only}/contents/{quote(path)}",
+                     headers=h, params={"ref": ref}, timeout=15)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    if len(r.content) > max_bytes:
+        raise manifest.ManifestError(f"{path} 超过 {max_bytes} 字节")
+    try:
+        return r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise manifest.ManifestError(f"{path} 不是 UTF-8 文本") from None
+
+
+def release_manifest(repo: str, path_template: str, tag: str, registry: str | None = None) -> dict:
+    """按 tag 读发布清单(见 app/manifest.py),供审批卡精确显示本次发布的服务 / 迁移 / 配置。
+
+    🔴 所有文件都钉在【tag 解析出的同一个 commit】上读:先解 tag 再按 sha 取,
+       避免读清单和读迁移文件之间 tag 被挪动(或同名分支抢了 ref),拼出一张前后不一致的卡。
+    迁移文件逐个扫破坏性语句(同 db_migration_changes 的规则):看的是【本次真正要执行的文件全文】,
+    不是时间口径的目录变更。
+
+    失败抛异常(由调用方 fail-close):内容 / 配置问题 → ManifestError;GitHub 不可达等 → 其他异常。
+    """
+    path = manifest.manifest_path(path_template, tag)
+    sha = tag_commit(repo, tag)
+    if not sha:
+        raise manifest.ManifestError(f"tag `{tag}` 在 {repo} 上不存在")
+    text = _file_at(repo, path, sha, manifest.MAX_BYTES)
+    if text is None:
+        raise manifest.ManifestError(f"发布清单 {path} 在 tag `{tag}` 上不存在")
+    m = manifest.parse_manifest(text)
+    base = path.rsplit("/", 1)[0] if "/" in path else ""
+    for mig in m["migrations"]:
+        full = f"{base}/{mig['file']}" if base else mig["file"]
+        body = _file_at(repo, full, sha, manifest.MAX_BYTES)
+        if body is None:
+            raise manifest.ManifestError(f"迁移文件 {full} 在 tag `{tag}` 上不存在")
+        mig["danger"] = [label for rx, label in _DANGER_SQL if rx.search(body)]
+    info: dict = {}
+    if registry:
+        reg_path = manifest.safe_rel_path(registry, "release_manifest.registry")
+        reg_text = _file_at(repo, reg_path, sha, manifest.REGISTRY_MAX_BYTES)
+        if reg_text is None:
+            raise manifest.ManifestError(f"服务登记表 {reg_path} 在 tag `{tag}` 上不存在")
+        info = manifest.parse_registry(reg_text, m["services"])
+    m["services"] = [{"name": s, "image": (info.get(s) or {}).get("image"),
+                      "deployments": (info.get(s) or {}).get("deployments") or []}
+                     for s in m["services"]]
+    m.update(status="ok", path=path, commit=sha)
+    return m

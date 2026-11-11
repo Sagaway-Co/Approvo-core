@@ -19,7 +19,19 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from app import cards, deploycred, feishu, forms, github, k8s, keygrant, settings, store, wshealth
+from app import (
+    cards,
+    deploycred,
+    feishu,
+    forms,
+    github,
+    k8s,
+    keygrant,
+    manifest,
+    settings,
+    store,
+    wshealth,
+)
 
 
 @asynccontextmanager
@@ -277,6 +289,29 @@ def _collect_db_changes(rel: dict, req: "ReleaseReq") -> dict | None:
         deploy_repo, store.last_success_at(req.repo, req.stage), path=path)
 
 
+def _collect_manifest(rel: dict, req: "ReleaseReq") -> dict | None:
+    """发布清单 —— 让审批卡精确到服务(见 app/manifest.py)。没配 `release_manifest` 返回 None。
+
+    🔴 与变更清单 / 数据库变更不同,这里是 fail-close:配了清单却读不到,就【不发审批】。
+       那两块是"补充信息",查不到可以标"无法判定";而清单回答的是"批的到底是什么",
+       回答不了就不该让人去批。内容 / 配置问题 → 409(去改清单),GitHub 不可达 → 502。
+    """
+    cfg = rel.get("release_manifest")
+    if not cfg:
+        return None
+    if not isinstance(cfg, dict):
+        raise HTTPException(409, "release_manifest 配置必须是映射(repo / path / registry)")
+    repo = cfg.get("repo") or rel.get("source_repo") or req.repo
+    try:
+        m = github.release_manifest(repo, cfg.get("path"), req.git_tag or req.tag, cfg.get("registry"))
+    except (manifest.ManifestError, github.AppInstallLookupError) as e:
+        raise HTTPException(409, f"发布清单不可用(fail-close,不发审批):{e}")
+    except Exception as e:  # 宽捕获是有意的(BLE001 已在 ruff.toml 全局 ignore)
+        raise HTTPException(502, f"发布清单读取失败(fail-close,不发审批):{type(e).__name__}: {e}")
+    m["image_repo"] = rel.get("image_repo") or ""
+    return m
+
+
 def _collect_changes(rel: dict, req: "ReleaseReq", head: str) -> dict | None:
     """变更清单:上次成功部署的 commit → 本次 commit 之间的 PR/直接提交。
     基准取 gate 自己的部署记录(CI 不知道也改不了线上版本),失败只降级提示,不阻塞审批。"""
@@ -411,6 +446,9 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
         if not _ok:
             raise HTTPException(409, f"check-prereq 未通过：{_why}")
 
+    # 发布清单在建审批实例【之前】读:读不到就不惊动审批人(同 check-prereq 的 fail-close)
+    release_manifest = _collect_manifest(rel, req)
+
     image = f"{rel['image_repo']}:{req.tag}" if rel.get("image_repo") else req.tag
     method = rel.get("method", "kubectl")
 
@@ -479,6 +517,7 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
         "deploy": rel.get("deploy"),
         "changes": _collect_changes(rel, req, head_commit),
         "db_changes": _collect_db_changes(rel, req),
+        "manifest": release_manifest,
     }
     if settings.APPROVAL_PROVIDER == "slack":
         # 自批判定的依据随记录落库:点击可能发生在几小时后、甚至重启之后

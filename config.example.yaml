@@ -39,7 +39,7 @@ feishu:
 # slack 模式下上面的 feishu: 段可以整段删掉。
 # slack:
 #   approval_channel: "C0XXXXXXX"              # 审批频道 ID(不是 #名字);审批人 = 该频道【当前】成员
-#   result_channel: "C0YYYYYYY"                # 结果频道 ID;省略 = 审批频道
+#   result_channel: "C0YYYYYYY"                # 结果频道 ID;省略 = 审批频道(单卡模式:只更新审批那一条)
 #   forbid_self_approval: true                 # 禁止自批(默认 true;只认 YAML 布尔)
 #   user_map:                                  # GitHub 登录名 → Slack 用户(申请人映射 + 已登记审批人)
 #     alice: "U0XXXXXXX"
@@ -184,6 +184,11 @@ releases:
     db_migrations:
       repo: release-deploy                     # 迁移文件所在仓
       path: db/migrations                      # 目录前缀(默认 db/migrations)
+    # 可选:发布清单 —— monorepo 一次发多个服务时,让审批卡精确到服务(见 docs/CONFIGURATION.md)。
+    # 配了却读不到 / 格式不对 → 不发审批(fail-close)。
+    # release_manifest:
+    #   path: "releases/{tag}/release.yaml"    # 必须含 {tag}
+    #   registry: "deploy/services.yaml"       # 可选:服务登记表
     stages:                                    # 可选:一条 release 走多阶段
       pre:
         env: qa

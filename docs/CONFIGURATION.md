@@ -95,7 +95,7 @@ Slack App 怎么建、要哪 5 个 scope、两个 token 从哪拿,见 [SLACK.md]
 ```yaml
 slack:
   approval_channel: "C0XXXXXXX"     # 必填。审批频道 ID;审批人 = 该频道【当前】成员
-  result_channel: "C0YYYYYYY"       # 可选。部署中 / 结果 / 拒绝通知发这里;缺省 = 审批频道
+  result_channel: "C0YYYYYYY"       # 可选。部署中 / 结果 / 拒绝通知发这里;缺省 = 审批频道(单卡模式)
   forbid_self_approval: true        # 可选,默认 true。只认 YAML 布尔(写成 "false" 字符串会拒绝启动)
   user_map:                         # GitHub 登录名(大小写不敏感)→ Slack 用户
     alice: "U0XXXXXXX"
@@ -108,7 +108,7 @@ slack:
 | 字段 | 说明 |
 | --- | --- |
 | `approval_channel` | 只认频道 ID(`C…` / `G…`),不认 `#频道名`。机器人必须在频道里;不能是 Slack Connect 外部共享频道 |
-| `result_channel` | 同上;缺省等于审批频道 |
+| `result_channel` | 同上;缺省等于审批频道 —— 此时为**单卡模式**:不另发「部署中 / 结果 / 被拒」消息,只更新审批那一条,并在卡上留时间线 |
 | `forbid_self_approval` | 禁止申请人批准自己的申请(默认开)。申请人映射不出来时的 fail-close 策略见 [SLACK.md](SLACK.md#申请人怎么映射映射不出来怎么办) |
 | `user_map` | 申请人映射 + "已登记审批人"名单。**只在 config 里维护**(改动走 git 审查、重启生效),slack 模式下 `/admin` 映射页返回 501 —— 映射直接决定自批判定,不该能被一个 Basic Auth 口令热改 |
 | `approvers` | `stage → [user ID]`,非空列表。与飞书 `approval_codes` 同一套回落:stage 自己的条目 > `default` > 不限定 |
@@ -230,6 +230,11 @@ releases:
     db_migrations:
       repo: <repo_holding_migrations>       # 迁移文件所在仓(通常是部署仓)
       path: db/migrations                   # 目录前缀,默认 db/migrations
+    # (可选) 发布清单:monorepo 一次发多个服务时,让审批卡【精确到服务】。见下文「发布清单」。
+    release_manifest:
+      repo: <source_repo>                   # 省略则用 source_repo
+      path: "releases/{tag}/release.yaml"   # 必须含 {tag};按 tag 解析出的 commit 读取
+      registry: "deploy/services.yaml"      # 可选:服务登记表,补出镜像名与工作负载名
     # ↓↓↓ 按 stage 覆盖 (可选) ↓↓↓
     # 让一条 release 走 pre/release/hotfix 三阶段,而不必拆成三条 release_key.
     # 卡片"应用"字段直接显示 release_key = 应用名 (符合"应用名=仓名"规矩).
@@ -281,6 +286,32 @@ releases:
 
 ⚠️ **口径**:基线是"本应用上次成功部署的**时间**",不是"数据库里未应用的迁移"
 —— approvo 够不到数据库。卡片里如实写明这一点;真正会执行哪些,以你的迁移门禁为准。
+
+## 发布清单:让审批卡精确到服务
+
+一个仓库里放着多个服务时,卡片上的「应用」只是仓库名、「镜像」只是 `image_repo:tag`,
+审批人看不出这次到底换哪几个服务、跑不跑迁移、改不改配置。配了 `release_manifest` 之后,
+approvo 在受理 `/release` 时按 tag 读清单文件,卡片改为显示:
+
+- 「服务」字段 + 「🧩 发布清单」区块:按发布顺序列出服务,有登记表时附工作负载名与镜像 `<image>:<tag>`
+- 本次要执行的迁移文件(按**文件全文**扫破坏性语句加 🔴,不是时间口径)、要 apply 的 ConfigMap、说明
+- 批准确认框与通知文本都写出服务名
+
+清单格式:
+
+```yaml
+services: [svc-a, svc-b]            # 必填;按发布顺序;不发服务写 []
+migrations:                          # 可选;file 相对清单所在目录
+  - {database: main_db, file: migrations/001_add_x.sql}
+configmaps: [deploy/cm/svc-a.yaml]   # 可选;仓库内路径
+notes: 一句话说明                     # 可选
+```
+
+登记表(可选)只读 `services.<name>.image` 与 `services.<name>.deploy[].deployment`。
+
+⚖️ **fail-close**:配了清单却读不到、格式不对、引用的文件不存在、服务没登记 → `/release` 返回 409
+(GitHub 不可达返回 502),**不发审批**。清单回答的是"批的到底是什么",回答不了就不该让人去批。
+所有文件都钉在 tag 解析出的**同一个 commit** 上读,路径一律校验(不许 `..`、绝对路径、奇怪字符)。
 
 ## 三条通道共用的一条判据:不猜
 

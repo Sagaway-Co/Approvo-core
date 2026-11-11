@@ -146,6 +146,79 @@ def _env_change(spec: dict) -> str:
     return f"*🔧 环境变更*\n```{_clip(body, _TEXT_MAX - 200)}```{more}"
 
 
+def _services_short(spec: dict) -> str:
+    """清单里的服务名,逗号连起来(用于字段 / 按钮确认 / 通知标题);没有清单返回空串。"""
+    m = spec.get("manifest") or {}
+    return "、".join(str(s.get("name")) for s in (m.get("services") or []))
+
+
+def _subject(spec: dict) -> str:
+    """一句话说清批的是什么:仓库 + 版本,有清单时再精确到服务。"""
+    svcs = _services_short(spec)
+    m = spec.get("manifest")
+    if m and not svcs:
+        svcs = "不发服务"
+    return f"{spec['repo']} {spec['tag']}" + (f"({_clip(svcs, 120)})" if svcs else "")
+
+
+def _manifest(spec: dict) -> str | None:
+    """「发布清单」区块(语义同 cards._manifest_block):本次发哪些服务、用哪个镜像、
+    跑哪些迁移、apply 哪些 ConfigMap —— 全部取自 tag 对应 commit 上的清单文件。
+    没配 release_manifest 返回 None(调用方回落到旧的「镜像 + 环境变更」两块)。"""
+    m = spec.get("manifest")
+    if not m:
+        return None
+    tag = spec.get("tag") or ""
+    lines = [f"*🧩 发布清单* {_code(m.get('path'))} @ {_code(str(m.get('commit') or '')[:12])}"]
+    svcs = m.get("services") or []
+    if svcs:
+        lines.append(f"*服务({len(svcs)},按此顺序发布)*")
+        for sv in svcs[:20]:
+            deps = sv.get("deployments") or []
+            tail = (" → " + " ".join(_code(d) for d in deps)) if deps else ""
+            img = f"\n    镜像 {_code(str(sv['image']) + ':' + tag)}" if sv.get("image") else ""
+            lines.append(f"· *{esc(sv.get('name'))}*{tail}{img}")
+        if len(svcs) > 20:
+            lines.append(f"· …共 {len(svcs)} 个服务")
+        if m.get("image_repo"):
+            lines.append(f"镜像仓库 {_code(m['image_repo'])}")
+    else:
+        lines.append("*服务*:无 —— 本次不发布任何服务")
+    migs = m.get("migrations") or []
+    if migs:
+        lines.append(f"*🗄 数据库迁移({len(migs)},按此顺序执行)*")
+        for g in migs[:15]:
+            danger = ("  🔴 " + " / ".join(esc(x) for x in g["danger"])) if g.get("danger") else ""
+            lines.append(f"· {_code(g.get('database'))} ← {_code(g.get('file'))}{danger}")
+        if len(migs) > 15:
+            lines.append(f"· …共 {len(migs)} 个迁移")
+        if any(g.get("danger") for g in migs):
+            lines.append("🔴 含破坏性语句 —— 镜像可回滚、schema 不可回滚,"
+                         "回滚镜像只会让旧代码撞上已变的表结构。")
+    else:
+        lines.append("*🗄 数据库迁移*:无")
+    cms = m.get("configmaps") or []
+    if cms:
+        lines.append(f"*🔧 ConfigMap({len(cms)})*")
+        lines += [f"· {_code(c)}" for c in cms[:15]]
+    else:
+        lines.append("*🔧 ConfigMap*:无")
+    if m.get("notes"):
+        lines.append(f"*说明*:{esc(_clip(str(m['notes']), 300))}")
+    return "\n".join(lines)
+
+
+def _what(spec: dict) -> list:
+    """「发什么」区块组:有清单 → 清单(另有 notes 时附环境变更);没有 → 旧的镜像 + 环境变更。"""
+    man = _manifest(spec)
+    if man:
+        out = [_section(man)]
+        if (spec.get("notes") or "").strip():
+            out.append(_section(_env_change(spec)))
+        return out
+    return [_section(_image(spec)), _section(_env_change(spec))]
+
+
 def _db_change(spec: dict) -> str | None:
     """语义同 cards._db_change_block:没配 db_migrations 不渲染;查不到绝不渲染成「无变更」。"""
     d = spec.get("db_changes")
@@ -220,22 +293,48 @@ def _policy(spec: dict) -> str:
     return " · ".join(parts)
 
 
-def _decision(dec: dict) -> str:
+def _single_message() -> bool:
+    """单卡模式:结果频道就是审批频道(没另配 result_channel)时,不再另发「部署中 / 结果 / 被拒」消息,
+    只更新审批那一条 —— 同一个频道里三条消息说的是同一件事,只会把状态冲散。
+    另配了结果频道时保持原行为(那是有人专门订阅结果的地方)。"""
+    return settings.SLACK_RESULT_CHANNEL == settings.SLACK_APPROVAL_CHANNEL
+
+
+def _hm(when, ref) -> str:
+    """'YYYY-MM-DD HH:MM' → 同一天只显示 HH:MM,跨天带日期。"""
+    w, r = str(when or ""), str(ref or "")
+    if len(w) == 16 and w[:10] == r[:10]:
+        return w[11:]
+    return w or "-"
+
+
+def _timeline(spec: dict, dec: dict) -> str:
+    """进度时间线:发起 → 批准/拒绝 → 部署中 → 完成。消息只保留最新状态,经过的每一步在这一行里留时间。"""
+    submit = spec.get("submit_time") or ""
     uid = _uid(dec.get("user"))
     who = (f"<@{uid}>" if uid else "-") + (f"({esc(dec['name'])})" if dec.get("name") else "")
-    when = esc(dec.get("when") or "-")
+    steps = [f"{_code(_hm(submit, submit))} 发起"]
     if dec.get("kind") == "rejected":
-        return f"🚫 {who} 于 {when} 拒绝"
+        steps.append(f"{_code(_hm(dec.get('when'), submit))} {who} 🚫 拒绝")
+        return "*🕒 进度* " + " → ".join(steps)
+    steps.append(f"{_code(_hm(dec.get('when'), submit))} {who} 批准")
     final = dec.get("final")
-    tail = {None: "部署中…", "deploying": "部署中…", "success": "✅ 已部署",
-            "failed": "❌ 部署失败(详情见结果频道)"}.get(final, f"状态:{esc(final)}")
-    return f"✅ {who} 于 {when} 批准 · {tail}"
+    if dec.get("deploying_at"):
+        steps.append(f"{_code(_hm(dec['deploying_at'], submit))} 部署中")
+    if final in ("success", "failed"):
+        mark = "✅ 已部署" if final == "success" else "❌ 部署失败"
+        steps.append(f"{_code(_hm(dec.get('finished_at') or '', submit))} {mark}")
+    elif final not in (None, "deploying"):
+        steps.append(f"状态:{esc(final)}")
+    else:
+        steps.append("…")
+    return "*🕒 进度* " + " → ".join(steps)
 
 
 def _buttons(instance_code: str, spec: dict) -> dict:
     """批准(primary)/ 拒绝(danger),都带 confirm 弹窗 —— 一次误触就是一次生产发版。"""
     is_prod = _is_prod(spec)
-    what = f"*{esc(spec['repo'])}* {_code(spec['tag'])}" + (" 到 *生产*" if is_prod else "")
+    what = f"*{esc(_subject(spec))}*" + (" 到 *生产*" if is_prod else "")
     return {"type": "actions", "block_id": DECISION_BLOCK, "elements": [
         {"type": "button", "action_id": APPROVE_ACTION, "style": "primary", "value": instance_code,
          "text": {"type": "plain_text", "text": "✅ 批准", "emoji": True},
@@ -286,18 +385,29 @@ def approval_message(instance_code: str, spec: dict, decision: dict | None = Non
         ("部署到", _target(spec)),
         ("申请人", _applicant(spec)),
         ("申请时间", esc(spec.get("submit_time") or "-")),
-    ]), _section(_image(spec)), _section(_env_change(spec))]
+        *_service_field(spec),
+    ]), *_what(spec)]
     for extra in (_db_change(spec), _changes(spec)):
         if extra:
             blocks.append(_section(extra))
     if decision is None:
         blocks += [_context(_policy(spec)), _buttons(instance_code, spec)]
     else:
-        blocks.append(_section(_decision(decision)))
+        blocks.append(_section(_timeline(spec, decision)))
+        if decision.get("final") == "failed" and decision.get("log"):
+            tail = esc(str(decision["log"])[-_LOG_TAIL:]).replace("```", "'''")
+            blocks.append(_section(f"*失败详情*\n```{tail}```"))
     blocks.append(_context(f"审批单号 {_code(instance_code)}"))
     if is_prod:
         blocks = [_prod_fence(), *blocks, _prod_fence()]
-    return f"{title}:{spec['repo']} {spec['tag']}", blocks
+    return f"{title}:{_subject(spec)}", blocks
+
+
+def _service_field(spec: dict) -> list:
+    """有清单时在字段区直接写出服务名 —— 审批人第一眼就该看到换的是哪几个服务。"""
+    if not spec.get("manifest"):
+        return []
+    return [("服务", esc(_services_short(spec)) or "无(不发服务)")]
 
 
 def _result_fields(spec: dict, approver_name, info: str, when) -> dict:
@@ -310,6 +420,7 @@ def _result_fields(spec: dict, approver_name, info: str, when) -> dict:
         ("审批人", _approver(spec, approver_name)),
         ("审批信息", info),
         ("时间", esc(when or "-")),
+        *_service_field(spec),
     ])
 
 
@@ -317,11 +428,11 @@ def deploying_message(spec: dict, approver_name, when) -> tuple[str, list]:
     prefix = _title_prefix(spec)
     title = f"🚀 {prefix}生产部署中…" if _is_prod(spec) else f"🚀 {prefix}已审批 · 部署中…"
     blocks = [_header(title), _result_fields(spec, approver_name, "审批通过,部署中", when),
-              _section(_image(spec)), _section(_env_change(spec))]
+              *_what(spec)]
     db = _db_change(spec)
     if db:
         blocks.append(_section(db))
-    return f"{title}:{spec['repo']} {spec['tag']}", blocks
+    return f"{title}:{_subject(spec)}", blocks
 
 
 def result_message(spec: dict, ok: bool = True, rejected: bool = False, approver_name=None,
@@ -335,9 +446,12 @@ def result_message(spec: dict, ok: bool = True, rejected: bool = False, approver
         title, info = f"✅ {prefix}{prod}版本已部署", "审批通过"
     else:
         title, info = f"❌ {prefix}{prod}部署失败", "审批通过(部署失败)"
-    blocks = [_header(title), _result_fields(spec, approver_name, info, when), _section(_image(spec))]
-    if not rejected:
-        blocks.append(_section(_env_change(spec)))
+    blocks = [_header(title), _result_fields(spec, approver_name, info, when)]
+    if rejected:
+        man = _manifest(spec)
+        blocks.append(_section(man or _image(spec)))
+    else:
+        blocks += _what(spec)
         db = _db_change(spec)
         if db:
             blocks.append(_section(db))
@@ -348,7 +462,7 @@ def result_message(spec: dict, ok: bool = True, rejected: bool = False, approver
     if not rejected and not ok and log:
         tail = esc(log[-_LOG_TAIL:]).replace("```", "'''")
         blocks.append(_section(f"*失败详情*\n```{tail}```"))
-    return f"{title}:{spec['repo']} {spec['tag']}", blocks
+    return f"{title}:{_subject(spec)}", blocks
 
 
 # ─────────────────── 发送 ───────────────────
@@ -379,15 +493,52 @@ def _safe_post_result(text: str, blocks: list, what: str) -> None:
         print(f"[slack][warn] 发送{what}通知失败(不影响部署): {type(e).__name__}: {e}")
 
 
+def _card_ref(spec: dict) -> dict | None:
+    """审批消息的定位与决策状态(由 approval._approve 放进 run_spec,只在本次部署的内存里流转)。"""
+    ref = spec.get("_slack_card")
+    return ref if isinstance(ref, dict) and ref.get("channel") and ref.get("ts") else None
+
+
+def _refresh_card(spec: dict) -> None:
+    ref = _card_ref(spec)
+    if ref:
+        update_approval(ref["channel"], ref["ts"], ref.get("ic") or "", spec, ref["decision"])
+
+
 def notify_deploying(spec: dict, approver_name, when) -> None:
+    ref = _card_ref(spec)
+    if ref:
+        ref["decision"]["deploying_at"] = when
+        _refresh_card(spec)
+        if _single_message():
+            return
     _safe_post_result(*deploying_message(spec, approver_name, when), "部署中")
 
 
 def notify_result(spec: dict, ok: bool, approver_name, when, log: str | None = None) -> None:
+    ref = _card_ref(spec)
+    if ref:
+        dec = ref["decision"]
+        dec.update(final="success" if ok else "failed", finished_at=when)
+        if not ok and log:
+            dec["log"] = log[-_LOG_TAIL:]
+        _refresh_card(spec)
+        if _single_message():
+            if not ok:
+                # 改消息不推送通知:失败在线程里叫一下审批人,不在频道里另起一条
+                uid = _uid(dec.get("user"))
+                try:
+                    client.post_thread_reply(ref["channel"], ref["ts"],
+                                             (f"<@{uid}> " if uid else "") + "❌ 部署失败,详情见上方卡片。")
+                except Exception as e:  # 提醒失败不影响状态
+                    print(f"[slack][warn] 失败提醒发送失败: {type(e).__name__}: {e}")
+            return
     _safe_post_result(*result_message(spec, ok=ok, approver_name=approver_name, when=when, log=log),
                       "结果")
 
 
 def notify_rejected(spec: dict, approver_name, when) -> None:
+    if _single_message():
+        return      # 审批消息已改成「已拒绝」并写明谁、何时
     _safe_post_result(*result_message(spec, rejected=True, approver_name=approver_name, when=when),
                       "拒绝")

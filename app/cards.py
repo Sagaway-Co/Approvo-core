@@ -111,6 +111,52 @@ def _image_block(spec: dict) -> dict:
     return {"tag": "div", "text": {"tag": "lark_md", "content": f"**镜像**\n`{img}`"}}
 
 
+def _manifest_block(spec: dict) -> dict | None:
+    """「发布清单」区块(语义同 Slack messaging._manifest):本次发哪些服务、用哪个镜像、
+    跑哪些迁移、apply 哪些 ConfigMap —— 取自 tag 对应 commit 上的清单文件。没配清单返回 None。"""
+    m = spec.get("manifest")
+    if not m:
+        return None
+    tag = _md_safe(spec.get("tag") or "")
+    lines = [f"**🧩 发布清单** `{_md_safe(m.get('path') or '')}` @ `{_md_safe(str(m.get('commit') or '')[:12])}`"]
+    svcs = m.get("services") or []
+    if svcs:
+        lines.append(f"**服务({len(svcs)},按此顺序发布)**")
+        for sv in svcs[:20]:
+            deps = " ".join(f"`{_md_safe(d)}`" for d in sv.get("deployments") or [])
+            img = f" · 镜像 `{_md_safe(sv['image'])}:{tag}`" if sv.get("image") else ""
+            lines.append(f"· **{_md_safe(sv.get('name'))}**" + (f" → {deps}" if deps else "") + img)
+        if len(svcs) > 20:
+            lines.append(f"· …共 {len(svcs)} 个服务")
+        if m.get("image_repo"):
+            lines.append(f"镜像仓库 `{_md_safe(m['image_repo'])}`")
+    else:
+        lines.append("**服务**:无 —— 本次不发布任何服务")
+    migs = m.get("migrations") or []
+    if migs:
+        lines.append(f"**🗄 数据库迁移({len(migs)},按此顺序执行)**")
+        for g in migs[:15]:
+            danger = ("  🔴 " + " / ".join(g["danger"])) if g.get("danger") else ""
+            lines.append(f"· `{_md_safe(g.get('database'))}` ← `{_md_safe(g.get('file'))}`{danger}")
+        if any(g.get("danger") for g in migs):
+            lines.append("🔴 含破坏性语句 —— 镜像可回滚、schema 不可回滚,回滚镜像只会让旧代码撞上已变的表结构。")
+    else:
+        lines.append("**🗄 数据库迁移**:无")
+    cms = m.get("configmaps") or []
+    lines.append("**🔧 ConfigMap**:" + ("无" if not cms else "\n" + "\n".join(f"· `{_md_safe(c)}`" for c in cms[:15])))
+    if m.get("notes"):
+        lines.append(f"**说明**:{_md_safe(str(m['notes']))[:300]}")
+    return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}
+
+
+def _what_blocks(spec: dict) -> list:
+    """有清单 → 清单(另有 notes 时附环境变更);没有 → 镜像 + 环境变更(原行为)。"""
+    man = _manifest_block(spec)
+    if man:
+        return [man] + (_env_change_block(spec) if (spec.get("notes") or "").strip() else [])
+    return [_image_block(spec), *_env_change_block(spec)]
+
+
 def _env_change_block(spec: dict) -> list:
     """「环境变更」区块 —— 每张卡固定有这一行，回答审批人最该问的问题：
     **这次除了换镜像，还动了配置吗？**
@@ -211,8 +257,7 @@ def submit_card(spec: dict) -> dict:
             ("申请人", _applicant_lines(spec)),
             ("申请时间", spec.get("submit_time", "-")),
         ])},
-        _image_block(spec),
-        *_env_change_block(spec),
+        *_what_blocks(spec),
         *_db_change_block(spec),
         *_changes_block(spec),
         {"tag": "note", "elements": [{"tag": "plain_text", "content": note_content}]},
@@ -242,8 +287,7 @@ def deploying_card(spec: dict, approver_name: str | None = None, when: str | Non
             ("审批信息", "审批通过,部署中"),
             ("时间", when or "-"),
         ])},
-        _image_block(spec),
-        *_env_change_block(spec),
+        *_what_blocks(spec),
         *_db_change_block(spec),
     ]
     if is_prod:
@@ -283,8 +327,7 @@ def result_card(spec: dict, ok: bool = True, rejected: bool = False, status: str
             ("审批信息", approval_info),
             ("时间", when or "-"),
         ])},
-        _image_block(spec),
-        *_env_change_block(spec),
+        *_what_blocks(spec),
         *_db_change_block(spec),
     ]
     # 仅「版本已部署」同步带变更清单(部署中/失败/拒绝卡不带,不另发卡片)

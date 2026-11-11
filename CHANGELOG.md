@@ -16,6 +16,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **发布清单(`releases.*.release_manifest`)**:monorepo 一次发多个服务时,审批卡按 tag 对应 commit 上的清单文件
+  **精确到服务**显示 —— 服务(按发布顺序,可选附工作负载名与镜像)、要执行的迁移(按文件全文扫破坏性语句)、
+  要 apply 的 ConfigMap 与说明;批准确认框与通知文本也写出服务名。配了却读不到 / 格式不对 / 引用不存在 →
+  `/release` 409(GitHub 不可达 502),不发审批。飞书卡片同步支持。见 docs/CONFIGURATION.md「发布清单」。
+- **Slack 单卡模式**:未另配 `result_channel` 时,不再另发「部署中 / 结果 / 被拒」消息,只更新审批那一条,
+  卡上留时间线(发起 → 批准 → 部署中 → 完成);失败附日志尾部并在线程里 @ 审批人。另配结果频道时行为不变。
+
 - **Slack 审批提供方(`APPROVAL_PROVIDER=slack`,Socket Mode)**。默认仍是 `feishu`,飞书路径行为不变;
   两种模式互不要求对方的配置,未知取值拒绝启动。见 [docs/SLACK.md](docs/SLACK.md)。
   - 只出站(Socket Mode WSS),不需要公网回调地址;凭据 `SLACK_BOT_TOKEN`(xoxb-)/ `SLACK_APP_TOKEN`(xapp-)
