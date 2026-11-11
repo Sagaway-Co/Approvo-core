@@ -192,3 +192,25 @@ def test_uuid_includes_stage():
     expr = m.group(1)
     for part in ("req.repo", "req.tag", "req.stage", "req.commit"):
         assert part in expr, f"uuid 计算式缺 {part}：{expr}"
+
+
+def test_ttl_env_bounds(monkeypatch):
+    """DEPLOY_CRED_TTL_MIN 只接受 10..60;非法值拒绝启动,绝不回落默认值。"""
+    import pytest
+    for ok in ("10", "30", "60"):
+        monkeypatch.setenv("DEPLOY_CRED_TTL_MIN", ok)
+        assert deploycred._ttl_from_env() == int(ok)
+    for bad in ("9", "61", "0", "-5", "abc", "15m"):
+        monkeypatch.setenv("DEPLOY_CRED_TTL_MIN", bad)
+        with pytest.raises(RuntimeError):
+            deploycred._ttl_from_env()
+
+
+def test_grant_carries_approver_for_audit():
+    """兑换结果带回审批单号与审批人,供流水线写迁移台账;未提供时为空串而不是缺键。"""
+    g, _ = deploycred.issue_grant("slk-1", "c", "ns", approved_by="Alice")
+    ok, payload, _ = deploycred.redeem_grant(g)
+    assert ok and payload["instance_code"] == "slk-1" and payload["approved_by"] == "Alice"
+    g2, _ = deploycred.issue_grant("slk-2", "c", "ns")
+    ok, payload, _ = deploycred.redeem_grant(g2)
+    assert ok and payload["approved_by"] == ""

@@ -32,11 +32,25 @@ secrets delete 权限,它就有权删掉那个 namespace 里的真机密(数据�
 故固定 8 个槽位名,RBAC 里 delete 用 resourceNames 限死这 8 个;approvo 每次挑空槽。
 槽满 = 拒绝签发(fail-close),绝不退化成"不绑定就签"。
 """
+import os
 import secrets
 import threading
 import time
 
-TTL_MIN = 10                      # 与 API server 的 TokenRequest 下限一致
+
+def _ttl_from_env() -> int:
+    """DEPLOY_CRED_TTL_MIN:部署凭据有效分钟数,默认 10。
+
+    🔴 只接受 10..60:TokenRequest 下限 10 分钟(更短会被 API server 拒绝);上限防止误配成长期凭据。
+    取值非法【拒绝启动】,绝不悄悄回落到某个默认值。部署结束仍会立即吊销,这里只是上限。
+    """
+    raw = os.environ.get("DEPLOY_CRED_TTL_MIN", "10").strip()
+    if not raw.isdigit() or not 10 <= int(raw) <= 60:
+        raise RuntimeError(f"DEPLOY_CRED_TTL_MIN 必须是 10..60 的整数,当前 {raw!r}")
+    return int(raw)
+
+
+TTL_MIN = _ttl_from_env()        # 默认与 API server 的 TokenRequest 下限一致
 SLOTS = 8                         # 与 RBAC resourceNames 里的槽位数一一对应
 SLOT_FMT = "approvo-deploy-cred-{}"
 
@@ -51,19 +65,20 @@ def _purge_locked(now: float) -> None:
 
 
 def issue_grant(instance_code: str, cluster: str, namespace: str,
-                ttl_min: int = TTL_MIN) -> tuple[str, int]:
-    """签发一次性兑换券。返回 (grant, 有效分钟)。"""
+                ttl_min: int = TTL_MIN, approved_by: str = "") -> tuple[str, int]:
+    """签发一次性兑换券。返回 (grant, 有效分钟)。approved_by 随兑换结果回给流水线,用于留痕。"""
     g = secrets.token_urlsafe(32)
     now = time.time()
     with _lock:
         _purge_locked(now)
         _grants[g] = {"instance_code": instance_code, "cluster": cluster,
-                      "namespace": namespace, "exp": now + ttl_min * 60}
+                      "namespace": namespace, "approved_by": approved_by or "",
+                      "exp": now + ttl_min * 60}
     return g, ttl_min
 
 
 def redeem_grant(grant: str) -> tuple[bool, dict, str]:
-    """兑换。返回 (ok, {instance_code,cluster,namespace}, 错误原因)。
+    """兑换。返回 (ok, {instance_code,cluster,namespace,approved_by}, 错误原因)。
 
     🔴 一次性:成功即删除,整段在锁内 —— 并发下只有一个能成功。
     """
@@ -77,7 +92,7 @@ def redeem_grant(grant: str) -> tuple[bool, dict, str]:
             _grants.pop(grant, None)
             return False, {}, "凭证已过期"
         _grants.pop(grant, None)
-        return True, {k: rec[k] for k in ("instance_code", "cluster", "namespace")}, ""
+        return True, {k: rec.get(k, "") for k in ("instance_code", "cluster", "namespace", "approved_by")}, ""
 
 
 def claim_slot() -> str | None:

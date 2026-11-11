@@ -279,8 +279,10 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
     #    而不是让它悄悄回落到 runner 上的文件。
     cred_target = k8s.deploy_target_allowed(env_cluster(spec, env), _deploy_ns(spec, env))
     if cred_target:
+        approver = (spec.get("slack_approver") or {}).get("name") or ""
         grant, ttl = deploycred.issue_grant(spec.get("instance_code", "-"),
-                                            cred_target["cluster"], cred_target["namespace"])
+                                            cred_target["cluster"], cred_target["namespace"],
+                                            approved_by=approver)
         inputs["cred_grant"] = grant
         print(f"[github] 已签发部署凭据兑换券 target={cred_target['cluster']}/"
               f"{cred_target['namespace']} ttl={ttl}m")

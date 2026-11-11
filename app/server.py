@@ -798,8 +798,10 @@ def deploy_credential(req: DeployCredReq, x_release_token: str = Header(default=
         raise HTTPException(502, out)
     print(f"[deploy-cred] 签发 {cluster}/{namespace} slot={slot} "
           f"instance={payload['instance_code']} ttl={deploycred.TTL_MIN}m")
+    # instance_code / approved_by 供流水线留痕(如迁移台账),不是凭据。
     return {"kubeconfig": out, "slot": slot, "cluster": cluster,
-            "namespace": namespace, "expires_in_minutes": deploycred.TTL_MIN}
+            "namespace": namespace, "expires_in_minutes": deploycred.TTL_MIN,
+            "instance_code": payload["instance_code"], "approved_by": payload["approved_by"]}
 
 
 @app.post("/deploy-credential/revoke")

@@ -27,6 +27,7 @@ approvo 配置分两层:**环境变量** (敏感凭证) + **config.yaml** (业�
 | `REJECT_RATE_PER_MIN` |    | 认证失败的**独立拒绝桶**额度,默认 `600`;错 token / 错口令只消耗它,不吃正常业务额度,但仍有天花板 |
 | `ENABLE_DOCS` |    | 置 `1`/`true`/`yes` 才暴露 `/docs`、`/redoc`、`/openapi.json`;**默认关**(fail-close) |
 | `PUBLIC_GATE_URL` |    | 对外入口地址,**仅**用于在提示信息里拼可复制的 curl,不参与鉴权;不给真实默认值 |
+| `DEPLOY_CRED_TTL_MIN` |    | 动态部署凭据(`/deploy-credential`)的有效分钟数,默认 `10`,只接受 `10..60`,非法值**拒绝启动**。多服务 + 迁移的发版可适当调大;部署结束仍会立即吊销,这只是上限 |
 | `APPROVAL_BYPASS` |    | 审批直通模式;值为授权月 `YYYY-MM`(当月生效、跨月自动失效)。详见下方[审批直通模式](#审批直通模式-approval-bypass) |
 
 ## 为什么接口文档默认关
