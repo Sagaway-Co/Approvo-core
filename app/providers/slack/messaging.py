@@ -213,6 +213,10 @@ def _manifest(spec: dict) -> str | None:
         lines += [f"· {file_link(str(c))}" for c in cms[:15]]
     else:
         lines.append("*🔧 ConfigMap*:无")
+    deps = m.get("deployments") or []
+    if deps:
+        lines.append(f"*🧱 工作负载环境变量变更({len(deps)},按清单同步 env / envFrom)*")
+        lines += [f"· {file_link(str(d))}" for d in deps[:15]]
     if m.get("notes"):
         lines.append(f"*说明*:{esc(_clip(str(m['notes']), 300))}")
     return "\n".join(lines)

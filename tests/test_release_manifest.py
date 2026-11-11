@@ -28,6 +28,8 @@ migrations:
   - {database: main_db, file: migrations/002_drop_old.sql}
 configmaps:
   - deploy/cm/svc-a.yaml
+deployments:
+  - deploy/app/svc-b.yaml
 notes: "一句话说明 #123"
 """
 
@@ -82,6 +84,7 @@ def test_manifest_is_read_at_the_tag_commit_with_registry(gh):
     assert m["services"][1] == {"name": "svc-b", "image": "svc-b-img",
                                 "deployments": ["svc-b-server", "svc-b-worker"]}
     assert m["configmaps"] == ["deploy/cm/svc-a.yaml"] and m["notes"] == "一句话说明 #123"
+    assert m["deployments"] == ["deploy/app/svc-b.yaml"]
 
 
 def test_card_links_point_at_the_tag_commit(gh, monkeypatch):
@@ -125,7 +128,7 @@ def test_card_lists_services_images_migrations_and_configmaps(gh):
             "env": "prod", "submit_time": "2026-01-01 10:00", "manifest": m}
     text, blocks = messaging.approval_message("slk-x", spec)
     dump = json.dumps(blocks, ensure_ascii=False)
-    for want in ("svc-a", "svc-b-server", "svc-b-worker", "svc-a-img:V1.2.3-release",
+    for want in ("svc-a", "svc-b-server", "svc-b-worker", "svc-a-img:V1.2.3-release", "deploy/app/svc-b.yaml", "工作负载环境变量变更(1",
                  "registry.example.com/ns", "001_add_col.sql", "main_db", "deploy/cm/svc-a.yaml",
                  "🔴 DROP", "schema 不可回滚"):
         assert want in dump, want
@@ -169,6 +172,7 @@ def test_no_manifest_keeps_old_card(gh):
     ({"releases/V1.2.3-release/release.yaml":
       "services: []\nmigrations: [{database: d, file: m.sql, extra: 1}]\n"}, "只能有"),
     ({"releases/V1.2.3-release/release.yaml": "services: []\nconfigmaps: [/abs.yaml]\n"}, "不是合法的仓库内路径"),
+    ({"releases/V1.2.3-release/release.yaml": "services: []\ndeployments: [../x.yaml]\n"}, "不是合法的仓库内路径"),
     ({"releases/V1.2.3-release/release.yaml": "a: [\n"}, "YAML"),
 ])
 def test_bad_manifest_raises_manifest_error(gh, monkeypatch, files, why):

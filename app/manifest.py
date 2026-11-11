@@ -20,6 +20,7 @@
     migrations:                        # 可选;file 相对清单所在目录
       - {database: main_db, file: migrations/001_add_x.sql}
     configmaps: [deploy/cm/svc-a.yaml] # 可选;仓库内路径
+    deployments: [deploy/app/svc-a.yaml]  # 可选;要同步环境变量的工作负载清单(只展示,执行在流水线)
     notes: 一句话说明                   # 可选
 
 登记表(可选):`services.<name>.image` 与 `services.<name>.deploy[].deployment`。
@@ -117,11 +118,14 @@ def parse_manifest(text: str) -> dict:
         migrations.append({"database": db, "file": f})
     configmaps = [safe_rel_path(c, "ConfigMap 路径")
                   for c in _list(data, "configmaps", MAX_CONFIGMAPS)]
+    # 可选:本次要同步环境变量(env / envFrom)的工作负载清单文件。只展示,执行与校验在部署流水线
+    deployments = [safe_rel_path(d, "Deployment 清单路径")
+                   for d in _list(data, "deployments", MAX_CONFIGMAPS)]
     notes = data.get("notes")
     if notes is not None and not isinstance(notes, (str, int, float)):
         raise ManifestError("清单的 notes 必须是一行文本")
     return {"services": services, "migrations": migrations, "configmaps": configmaps,
-            "notes": "" if notes is None else str(notes).strip()}
+            "deployments": deployments, "notes": "" if notes is None else str(notes).strip()}
 
 
 def parse_registry(text: str, services: list[str]) -> dict:

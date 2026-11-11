@@ -158,6 +158,10 @@ def _manifest_block(spec: dict) -> dict | None:
         lines.append("**🗄 数据库迁移**:无")
     cms = m.get("configmaps") or []
     lines.append("**🔧 ConfigMap**:" + ("无" if not cms else "\n" + "\n".join(f"· {file_link(str(c))}" for c in cms[:15])))
+    deps = m.get("deployments") or []
+    if deps:
+        lines.append(f"**🧱 工作负载环境变量变更({len(deps)},按清单同步 env / envFrom)**\n"
+                     + "\n".join(f"· {file_link(str(d))}" for d in deps[:15]))
     if m.get("notes"):
         lines.append(f"**说明**:{_md_safe(str(m['notes']))[:300]}")
     return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}
