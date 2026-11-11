@@ -120,3 +120,56 @@ def test_menu_targets_is_config_driven():
     """settings 里给了 menu_targets 就必须能覆盖内置表。"""
     code = _code_only("app/events.py")
     assert "settings.MENU_TARGETS or {" in code, "菜单目标没有走配置驱动"
+
+
+# ---------- ③ 轮询抖动不得判部署失败;失败时带回真实原因 ----------
+
+class _Resp:
+    def __init__(self, status=200, data=None, text=""):
+        self.status_code, self._data, self.text = status, data, text
+
+    def json(self):
+        return self._data
+
+
+def test_poll_survives_read_timeouts_and_reports_job_errors(monkeypatch):
+    """2026-11-11:轮询时一次读超时,审批卡把"GitHub 超时"当成失败原因;真实原因(部署侧清单校验)看不到。"""
+    import requests as rq
+
+    from app import k8s
+    monkeypatch.setenv("GITHUB_APP_OWNER", "my-org")
+    monkeypatch.setattr(github.time, "sleep", lambda s: None)
+    monkeypatch.setattr(github, "_headers", lambda repo: {})
+    monkeypatch.setattr(k8s, "deploy_target_allowed", lambda c, n: None)
+    calls = {"run": 0}
+    title = "deploy demo v1.0.0 (prod)"
+
+    def fake_post(url, **kw):
+        return _Resp(204)
+
+    def fake_get(url, **kw):
+        if url.endswith("/runs") and "workflows" in url:
+            return _Resp(200, {"workflow_runs": [{"id": 7, "html_url": "https://github.com/x/r/actions/runs/7",
+                                                  "display_title": title}]})
+        if url.endswith("/actions/runs/7"):
+            calls["run"] += 1
+            if calls["run"] <= 2:
+                raise rq.exceptions.ReadTimeout("read timed out")
+            return _Resp(200, {"status": "completed", "conclusion": "failure"})
+        if url.endswith("/actions/runs/7/jobs"):
+            return _Resp(200, {"jobs": [{"id": 9, "name": "deploy", "conclusion": "failure",
+                                         "steps": [{"name": "发布", "conclusion": "failure"}]}]})
+        if url.endswith("/actions/jobs/9/logs"):
+            return _Resp(200, text="2026-11-11T09:36:10.1Z ##[error]清单校验失败：\n"
+                                   "2026-11-11T09:36:10.2Z ##[error]  - ConfigMap 'x' 不在部署账号可改的 13 个之内\n"
+                                   "2026-11-11T09:36:10.3Z ##[error]Process completed with exit code 1.\n")
+        raise AssertionError(url)
+
+    monkeypatch.setattr(github.requests, "post", fake_post)
+    monkeypatch.setattr(github.requests, "get", fake_get)
+    ok, msg = github.dispatch_and_wait({"repo": "demo", "tag": "v1.0.0",
+                                        "github": {"owner": "o", "repo": "r", "workflow": "w.yml", "env": "prod"}})
+    assert ok is False
+    assert "不在部署账号可改的 13 个之内" in msg, msg
+    assert "ReadTimeout" not in msg and "exit code" not in msg
+    assert calls["run"] >= 3, "读超时后应继续轮询,而不是直接判失败"

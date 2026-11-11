@@ -321,9 +321,13 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
     run_id, url = None, page
     for _ in range(20):
         time.sleep(3)
-        rr = requests.get(f"{API}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs",
-                          headers=_headers(repo), params={"event": "workflow_dispatch", "per_page": 20}, timeout=10)
-        for run in rr.json().get("workflow_runs", []):
+        try:
+            rr = _get_json(f"{API}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs", repo,
+                           params={"event": "workflow_dispatch", "per_page": 20})
+        except Exception as e:  # 查询是幂等的读:抖动就下一轮再查,不能因此判部署失败
+            print(f"[github] 定位 run 时查询失败(稍后重试): {type(e).__name__}: {e}")
+            continue
+        for run in rr.get("workflow_runs", []):
             if run.get("display_title") == title or run.get("name") == title:
                 run_id, url = run["id"], run["html_url"]
                 break
@@ -334,27 +338,72 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        d = requests.get(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}",
-                         headers=_headers(repo), timeout=10).json()
+        # 🔴 2026-11-11:轮询时 api.github.com 一次 10s 读超时,异常直接冒出来,
+        #    审批卡把"GitHub 超时"当成部署失败原因,真实原因(部署侧清单校验)反而看不到。
+        #    轮询只是幂等的读:失败就记一笔、等下一轮,直到 deadline;部署本身不受影响。
+        try:
+            d = _get_json(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}", repo)
+        except Exception as e:
+            print(f"[github] 轮询 run {run_id} 失败(稍后重试): {type(e).__name__}: {e}")
+            time.sleep(8)
+            continue
         if d.get("status") == "completed":
             concl = d.get("conclusion")
             if concl == "success":
                 return True, f"GitHub run {url} -> success"
             # 失败:列出失败的 step + run 链接(点进去看完整日志:拉不到镜像/健康检查等)
-            fails = []
+            fails, errors = [], []
             try:
-                jr = requests.get(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
-                                  headers=_headers(repo), timeout=10).json()
+                jr = _get_json(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs", repo)
                 for j in jr.get("jobs", []):
                     for st in j.get("steps", []) or []:
                         if st.get("conclusion") == "failure":
                             fails.append(f"{j.get('name')} / {st.get('name')}")
-            except Exception:
-                pass
+                    if j.get("conclusion") == "failure" and j.get("id"):
+                        errors += _job_error_lines(owner, repo, j["id"])
+            except Exception as e:
+                print(f"[github] 取失败详情失败(不影响结论): {type(e).__name__}: {e}")
             detail = ("失败步骤: " + "; ".join(fails) + "\n") if fails else ""
+            if errors:
+                detail += "失败原因:\n" + "\n".join(errors[-8:]) + "\n"
             return False, f"GitHub run -> {concl}\n{detail}完整日志: {url}"
         time.sleep(8)
     return False, f"GitHub run 超时未完成:{url}"
+
+
+def _get_json(url: str, repo: str, params: dict | None = None, tries: int = 4) -> dict:
+    """幂等的 GitHub 读请求:连接失败 / 读超时 / 5xx 退避重试;最后一次仍失败就抛出,由调用方决定怎么办。"""
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=_headers(repo), params=params, timeout=15)
+            if r.status_code >= 500:
+                raise requests.exceptions.HTTPError(f"HTTP {r.status_code}")
+            return r.json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                requests.exceptions.HTTPError, ValueError):
+            if i == tries - 1:
+                raise
+            time.sleep(3 * (i + 1))
+    return {}
+
+
+_ERR_LINE = re.compile(r"(?:##\[error\]|::error::)\s*(.*)")
+_TS_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z\s?")
+
+
+def _job_error_lines(owner: str, repo: str, job_id: int, limit: int = 8) -> list:
+    """失败 job 日志里的 ##[error] / ::error:: 行(部署脚本把失败原因写成这种行),原样带回审批卡。
+    🔴 只取错误行、截断长度:日志由部署脚本控制且已遮蔽凭据,但卡片仍只放必要信息。"""
+    r = requests.get(f"{API}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+                     headers=_headers(repo), timeout=20)
+    if r.status_code != 200:
+        return []
+    out = []
+    for ln in r.text.splitlines():
+        m = _ERR_LINE.search(_TS_PREFIX.sub("", ln))
+        if m and m.group(1).strip() and "Process completed with exit code" not in m.group(1):
+            out.append(m.group(1).strip()[:300])
+    return out[-limit:]
 
 
 # ---------- check-prereq：release 必须是同号 pre 的 promote ----------
