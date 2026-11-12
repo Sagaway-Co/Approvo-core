@@ -529,6 +529,25 @@ def notify_deploying(spec: dict, approver_name, when) -> None:
     _safe_post_result(*deploying_message(spec, approver_name, when), "部署中")
 
 
+def _result_reply(spec: dict, dec: dict, ok: bool) -> str:
+    """单卡模式下部署结束的线程回复:@ 申请人和审批人(同一人只 @ 一次);
+    申请人映射不到 Slack 时写出 GitHub 账号并说明无法 @。"""
+    ids = [u for u in (_uid(x) for x in spec.get("slack_applicant_ids") or []) if u]
+    if not ids:
+        gh = spec.get("operator_github")
+        who = (_code(gh) if gh else esc(spec.get("operator_name") or "申请人")) + "(未映射到 Slack 用户,无法 @)"
+    else:
+        who = ""
+    a = _uid(dec.get("user"))
+    if a and a not in ids:
+        ids.append(a)
+    mention = " ".join(f"<@{u}>" for u in ids)
+    head = " ".join(x for x in (mention, who) if x)
+    body = (f"✅ 部署完成:{esc(_subject(spec))}" if ok
+            else f"❌ 部署失败:{esc(_subject(spec))},详情见上方卡片。")
+    return f"{head} {body}" if head else body
+
+
 def notify_result(spec: dict, ok: bool, approver_name, when, log: str | None = None) -> None:
     ref = _card_ref(spec)
     if ref:
@@ -538,14 +557,12 @@ def notify_result(spec: dict, ok: bool, approver_name, when, log: str | None = N
             dec["log"] = log[-_LOG_TAIL:]
         _refresh_card(spec)
         if _single_message():
-            if not ok:
-                # 改消息不推送通知:失败在线程里叫一下审批人,不在频道里另起一条
-                uid = _uid(dec.get("user"))
-                try:
-                    client.post_thread_reply(ref["channel"], ref["ts"],
-                                             (f"<@{uid}> " if uid else "") + "❌ 部署失败,详情见上方卡片。")
-                except Exception as e:  # 提醒失败不影响状态
-                    print(f"[slack][warn] 失败提醒发送失败: {type(e).__name__}: {e}")
+            # 改消息不推送通知:部署结束(成功 / 失败)都在审批消息的线程里回一条,@ 申请人;
+            # 失败再叫上审批人。不在频道里另起一条,状态仍以卡片为准。
+            try:
+                client.post_thread_reply(ref["channel"], ref["ts"], _result_reply(spec, dec, ok))
+            except Exception as e:  # 提醒失败不影响状态
+                print(f"[slack][warn] 结果提醒发送失败: {type(e).__name__}: {e}")
             return
     _safe_post_result(*result_message(spec, ok=ok, approver_name=approver_name, when=when, log=log),
                       "结果")

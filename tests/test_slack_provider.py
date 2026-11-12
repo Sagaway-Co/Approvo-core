@@ -959,7 +959,8 @@ def test_single_card_mode_only_updates_the_approval_message(single, sync_threads
     ic = _submit()
     _click("approve", BOB, ic)
     assert _status(single, ic) == "success"
-    assert len(single.web.posts) == 1, "只应有最初那条审批消息"
+    top = [p for p in single.web.posts if not p.get("thread_ts")]
+    assert len(top) == 1, "频道里只应有最初那条审批消息"
     assert {u["ts"] for u in single.web.updates} == {"1700000000.000001"}
     final = json.dumps(single.web.updates[-1]["blocks"], ensure_ascii=False)
     for word in ("发起", "批准", "部署中", "已部署"):
@@ -979,7 +980,44 @@ def test_single_card_failure_shows_log_on_card_and_pings_in_thread(single, sync_
     thread = [p for p in single.web.posts if p.get("thread_ts")]
     assert len(thread) == 1 and thread[0]["thread_ts"] == "1700000000.000001"
     assert f"<@{BOB}>" in thread[0]["text"], "失败要在线程里叫到审批人(改消息不推送通知)"
+    assert f"<@{ALICE}>" in thread[0]["text"], "失败也要叫到申请人"
     assert len([p for p in single.web.posts if not p.get("thread_ts")]) == 1
+
+
+def test_single_card_success_replies_in_thread_and_mentions_applicant(single, sync_threads):
+    """改消息不推送通知:部署完成要在审批消息的线程里回一条,@ 申请人和审批人。"""
+    ic = _submit()
+    _click("approve", BOB, ic)
+    assert _status(single, ic) == "success"
+    thread = [p for p in single.web.posts if p.get("thread_ts")]
+    assert len(thread) == 1 and thread[0]["thread_ts"] == "1700000000.000001"
+    assert thread[0]["channel"] == CH
+    assert f"<@{ALICE}>" in thread[0]["text"] and "部署完成" in thread[0]["text"]
+    assert "demo V1.0.0-pre" in thread[0]["text"]
+    assert f"<@{BOB}>" in thread[0]["text"], "审批人也要被 @"
+    assert thread[0]["text"].count(f"<@{ALICE}>") == 1
+
+
+def test_single_card_success_reply_names_unmapped_applicant(single, sync_threads):
+    """申请人映射不到 Slack:照样回复,写出 GitHub 账号并说明无法 @;审批人照样 @。"""
+    ic = _submit(github_actor="eve-gh")
+    _click("approve", CAROL, ic)
+    assert _status(single, ic) == "success"
+    thread = [p for p in single.web.posts if p.get("thread_ts")]
+    assert len(thread) == 1
+    assert "eve-gh" in thread[0]["text"] and "无法 @" in thread[0]["text"]
+    assert f"<@{CAROL}>" in thread[0]["text"], "申请人 @ 不到时审批人照样 @"
+
+
+def test_single_card_thread_reply_failure_does_not_break_result(single, sync_threads, monkeypatch):
+    """线程回复发不出去(权限、限流)只记日志,部署结果与卡片照常。"""
+    def boom(*a, **k):
+        raise RuntimeError("ratelimited")
+    monkeypatch.setattr(messaging.client, "post_thread_reply", boom)
+    ic = _submit()
+    _click("approve", BOB, ic)
+    assert _status(single, ic) == "success"
+    assert "已部署" in single.web.updates[-1]["text"]
 
 
 def test_single_card_reject_posts_nothing_else(single, sync_threads):
