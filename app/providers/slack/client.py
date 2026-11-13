@@ -102,6 +102,13 @@ def update_message(channel: str, ts: str, text: str, blocks: list) -> None:
     web().chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
 
 
+def post_thread_reply(channel: str, thread_ts: str, text: str) -> None:
+    """在某条消息的线程里回复(不在频道里另起一条)。用于单卡模式下的失败提醒:
+    改消息不会推送通知,线程回复会 —— 失败需要有人被叫到。"""
+    web().chat_postMessage(channel=channel, thread_ts=thread_ts, text=text,
+                           unfurl_links=False, unfurl_media=False)
+
+
 def post_ephemeral(channel: str, user: str, text: str) -> None:
     """只有 user 能看见的提示(审批被拒的原因等)。不进频道历史,不打扰其他人。
     ⚠️ 对方不在该频道时 Slack 会报 user_not_in_channel —— 所以优先用 respond_ephemeral。"""

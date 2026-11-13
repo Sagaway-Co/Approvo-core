@@ -82,7 +82,7 @@ approvo 检测到外部共享会把审批链路判为不可用(`/readyz` 503、`
 ```yaml
 slack:
   approval_channel: "C0XXXXXXX"      # 审批频道 ID(必填)
-  result_channel: "C0YYYYYYY"        # 结果频道 ID(可省,默认同审批频道)
+  result_channel: "C0YYYYYYY"        # 结果频道 ID(可省,默认同审批频道 = 单卡模式)
   forbid_self_approval: true         # 禁止自批(默认 true)
   user_map:                          # GitHub 登录名 → Slack 用户
     alice: "U0XXXXXXX"
@@ -96,6 +96,16 @@ slack:
 
 启动后看日志里的 `[slack][up] Socket Mode 已连接`,或 `GET /readyz` 返回 200。
 连不上时日志是 `[ws][down] provider=slack ... err=...`(与飞书模式同一个告警关键字)。
+
+## 单卡模式
+
+没配 `result_channel`(或与审批频道相同)时,一次发版在频道里**只有一条消息**:
+批准、部署中、已部署 / 部署失败都更新这一条,消息只显示最新状态,并有一行时间线
+(`10:00 发起 → 10:05 某人 批准 → 10:05 部署中 → 10:07 ✅ 已部署`)。
+部署失败时卡上附日志尾部。部署结束(成功或失败)时,另在**该消息的线程里**回一条并 @ 申请人和审批人
+(同一人只 @ 一次):改消息不会推送通知,线程回复会。申请人映射不到 Slack 用户时,回复里写出其 GitHub 账号
+并注明无法 @。线程回复发送失败只记日志,不影响状态。
+另配了结果频道时保持原行为:审批消息照样更新,结果频道另收「部署中 / 结果 / 被拒」通知。
 
 ## 审批规则
 

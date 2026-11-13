@@ -216,8 +216,10 @@ def _approve(ic: str, spec: dict, uid: str, name: str, when: str,
     # 审计留痕:谁(ID + 显示名)、何时、批了哪条。日志关键字 [slack][approve] 可 grep。
     print(f"[slack][approve] instance={ic} {spec['repo']}:{spec['tag']} stage={spec.get('stage')} "
           f"approver={uid} name={name!r} at={when}")
-    run_spec = dict(spec, slack_approver={"id": uid, "name": name, "at": when})
     decision = {"kind": "approved", "user": uid, "name": name, "when": when}
+    # _slack_card:让「部署中 / 结果」直接更新这条审批消息(单卡模式),decision 在部署过程中被就地补上时间。
+    run_spec = dict(spec, slack_approver={"id": uid, "name": name, "at": when},
+                    _slack_card={"channel": channel, "ts": ts, "ic": ic, "decision": decision})
     messaging.update_approval(channel, ts, ic, run_spec, decision)
     # 部署:与飞书 / 审批直通【同一个】函数(发"部署中"→ 部署 → 落库 success/failed → 发结果)。
     # 这里已在独立线程里,同步调用即可;它内部兜住了部署器的一切异常。

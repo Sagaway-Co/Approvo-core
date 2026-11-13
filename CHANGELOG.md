@@ -16,6 +16,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Slack 单卡模式**:未另配 `result_channel` 时,不再另发「部署中 / 结果 / 被拒」消息,只更新审批那一条,
+  卡上留时间线(发起 → 批准 → 部署中 → 完成),失败附日志尾部;部署结束(成功 / 失败)在该消息线程里回复并
+  @ 申请人和审批人(改消息不推送通知)。另配结果频道时行为不变。
+
 - **Slack 审批提供方(`APPROVAL_PROVIDER=slack`,Socket Mode)**。默认仍是 `feishu`,飞书路径行为不变;
   两种模式互不要求对方的配置,未知取值拒绝启动。见 [docs/SLACK.md](docs/SLACK.md)。
   - 只出站(Socket Mode WSS),不需要公网回调地址;凭据 `SLACK_BOT_TOKEN`(xoxb-)/ `SLACK_APP_TOKEN`(xapp-)

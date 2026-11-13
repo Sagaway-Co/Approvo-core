@@ -39,7 +39,7 @@ feishu:
 # slack 模式下上面的 feishu: 段可以整段删掉。
 # slack:
 #   approval_channel: "C0XXXXXXX"              # 审批频道 ID(不是 #名字);审批人 = 该频道【当前】成员
-#   result_channel: "C0YYYYYYY"                # 结果频道 ID;省略 = 审批频道
+#   result_channel: "C0YYYYYYY"                # 结果频道 ID;省略 = 审批频道(单卡模式:只更新审批那一条)
 #   forbid_self_approval: true                 # 禁止自批(默认 true;只认 YAML 布尔)
 #   user_map:                                  # GitHub 登录名 → Slack 用户(申请人映射 + 已登记审批人)
 #     alice: "U0XXXXXXX"

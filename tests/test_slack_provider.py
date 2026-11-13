@@ -89,13 +89,14 @@ class FakeWeb:
             raise _api_error("users_not_found")
         return {"ok": True, "user": {"id": self.emails[email]}}
 
-    def chat_postMessage(self, channel, text, blocks, **kw):
+    def chat_postMessage(self, channel, text, blocks=None, **kw):
         if self.post_error:
             raise self.post_error
         with self._lock:
             self._ts += 1
             ts = f"1700000000.{self._ts:06d}"
-            self.posts.append({"channel": channel, "text": text, "blocks": blocks, "ts": ts})
+            self.posts.append({"channel": channel, "text": text, "blocks": blocks, "ts": ts,
+                               "thread_ts": kw.get("thread_ts")})
         return {"ok": True, "channel": channel, "ts": ts}
 
     def chat_update(self, channel, ts, text, blocks, **kw):
@@ -292,8 +293,8 @@ def test_member_approval_deploys_exactly_once(slk, sync_threads):
     assert sm.acks, "Socket Mode 事件必须 ack"
     assert slk.deploys == ["V1.0.0-pre"]
     assert _status(slk, ic) == "success"
-    # 原消息更新两次:已批准·部署中 → 已部署;都不再带按钮,且写明是谁批的
-    assert len(slk.web.updates) == 2
+    # 原消息更新四次:已批准 → 部署中(补时间)→ 结果(补时间)→ 落库后的终态;都不再带按钮,且写明是谁批的
+    assert len(slk.web.updates) == 4
     assert all(not _has_actions(u["blocks"]) for u in slk.web.updates)
     final = json.dumps(slk.web.updates[-1]["blocks"], ensure_ascii=False)
     assert f"<@{BOB}>" in final and "已部署" in final
@@ -917,6 +918,10 @@ def test_block_kit_stays_within_limits_for_huge_inputs(slk):
                                        for _ in range(20)]},
     }
     ic = approval.new_instance_code()
+    # 单卡模式:失败时卡上附日志尾部,超长日志也不能把消息撑出 Block Kit 上限
+    _validate(messaging.approval_message(ic, spec, {
+        "kind": "approved", "user": BOB, "name": "b", "when": "t", "deploying_at": "t",
+        "finished_at": "t", "final": "failed", "log": "E" * 50_000})[1])
     for dec in (None,
                 {"kind": "approved", "user": BOB, "name": long, "when": "t"},
                 {"kind": "approved", "user": BOB, "name": "b", "when": "t", "final": "success"},
@@ -928,3 +933,95 @@ def test_block_kit_stays_within_limits_for_huge_inputs(slk):
     _validate(messaging.result_message(spec, ok=False, approver_name="b", when="t",
                                        log="E" * 50_000)[1])
     _validate(messaging.result_message(spec, rejected=True, approver_name="b", when="t")[1])
+
+
+# ─────────────────────── 单卡模式(结果频道 = 审批频道) ───────────────────────
+
+@pytest.fixture()
+def single(slk, monkeypatch):
+    monkeypatch.setattr(settings, "SLACK_RESULT_CHANNEL", CH)
+    return slk
+
+
+def test_single_card_mode_only_updates_the_approval_message(single, sync_threads):
+    """没另配结果频道时:批准 → 部署中 → 已部署 全在同一条消息上,频道里不再多出两条。"""
+    ic = _submit()
+    _click("approve", BOB, ic)
+    assert _status(single, ic) == "success"
+    top = [p for p in single.web.posts if not p.get("thread_ts")]
+    assert len(top) == 1, "频道里只应有最初那条审批消息"
+    assert {u["ts"] for u in single.web.updates} == {"1700000000.000001"}
+    final = json.dumps(single.web.updates[-1]["blocks"], ensure_ascii=False)
+    for word in ("发起", "批准", "部署中", "已部署"):
+        assert word in final, f"时间线缺「{word}」"
+    assert "已部署" in single.web.updates[-1]["text"]
+    assert not _has_actions(single.web.updates[-1]["blocks"])
+
+
+def test_single_card_failure_shows_log_on_card_and_pings_in_thread(single, sync_threads):
+    single.deployer.ok, single.deployer.log = False, "rollout failed <!here>"
+    ic = _submit()
+    _click("approve", BOB, ic)
+    assert _status(single, ic) == "failed"
+    final = json.dumps(single.web.updates[-1]["blocks"], ensure_ascii=False)
+    assert "部署失败" in final and "失败详情" in final
+    assert "&lt;!here&gt;" in final and "<!here>" not in final, "卡上的部署日志必须转义"
+    thread = [p for p in single.web.posts if p.get("thread_ts")]
+    assert len(thread) == 1 and thread[0]["thread_ts"] == "1700000000.000001"
+    assert f"<@{BOB}>" in thread[0]["text"], "失败要在线程里叫到审批人(改消息不推送通知)"
+    assert f"<@{ALICE}>" in thread[0]["text"], "失败也要叫到申请人"
+    assert len([p for p in single.web.posts if not p.get("thread_ts")]) == 1
+
+
+def test_single_card_success_replies_in_thread_and_mentions_applicant(single, sync_threads):
+    """改消息不推送通知:部署完成要在审批消息的线程里回一条,@ 申请人和审批人。"""
+    ic = _submit()
+    _click("approve", BOB, ic)
+    assert _status(single, ic) == "success"
+    thread = [p for p in single.web.posts if p.get("thread_ts")]
+    assert len(thread) == 1 and thread[0]["thread_ts"] == "1700000000.000001"
+    assert thread[0]["channel"] == CH
+    assert f"<@{ALICE}>" in thread[0]["text"] and "部署完成" in thread[0]["text"]
+    assert "demo V1.0.0-pre" in thread[0]["text"]
+    assert f"<@{BOB}>" in thread[0]["text"], "审批人也要被 @"
+    assert thread[0]["text"].count(f"<@{ALICE}>") == 1
+
+
+def test_single_card_success_reply_names_unmapped_applicant(single, sync_threads):
+    """申请人映射不到 Slack:照样回复,写出 GitHub 账号并说明无法 @;审批人照样 @。"""
+    ic = _submit(github_actor="eve-gh")
+    _click("approve", CAROL, ic)
+    assert _status(single, ic) == "success"
+    thread = [p for p in single.web.posts if p.get("thread_ts")]
+    assert len(thread) == 1
+    assert "eve-gh" in thread[0]["text"] and "无法 @" in thread[0]["text"]
+    assert f"<@{CAROL}>" in thread[0]["text"], "申请人 @ 不到时审批人照样 @"
+
+
+def test_single_card_thread_reply_failure_does_not_break_result(single, sync_threads, monkeypatch):
+    """线程回复发不出去(权限、限流)只记日志,部署结果与卡片照常。"""
+    def boom(*a, **k):
+        raise RuntimeError("ratelimited")
+    monkeypatch.setattr(messaging.client, "post_thread_reply", boom)
+    ic = _submit()
+    _click("approve", BOB, ic)
+    assert _status(single, ic) == "success"
+    assert "已部署" in single.web.updates[-1]["text"]
+
+
+def test_single_card_reject_posts_nothing_else(single, sync_threads):
+    ic = _submit()
+    _click("reject", BOB, ic)
+    assert _status(single, ic) == "rejected"
+    assert len(single.web.posts) == 1
+    assert "拒绝" in json.dumps(single.web.updates[-1]["blocks"], ensure_ascii=False)
+
+
+def test_timeline_hides_date_on_same_day_and_keeps_it_across_days():
+    spec = {"submit_time": "2026-01-01 09:00"}
+    same = messaging._timeline(spec, {"kind": "approved", "user": BOB, "when": "2026-01-01 09:05",
+                                      "deploying_at": "2026-01-01 09:05",
+                                      "finished_at": "2026-01-01 09:07", "final": "success"})
+    assert "`09:00` 发起" in same and "`09:07` ✅ 已部署" in same
+    nxt = messaging._timeline(spec, {"kind": "approved", "user": BOB, "when": "2026-01-02 08:00"})
+    assert "2026-01-02 08:00" in nxt and nxt.endswith("…")
