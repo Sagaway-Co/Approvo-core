@@ -13,6 +13,10 @@
 | 改集群 Secret / 签发凭证的目标 | 拿到 `RELEASE_TOKEN` 的攻击者 | `cluster`/`namespace` 是请求体任意可填的 ⇒ 三条通道各有**配置白名单**,不配即整条关闭 |
 | 审批直通开关 | 有集群写权限的人 | 只能改 deployment 环境变量来开;**生产 fail-close**,且授权月跨月**自动失效** |
 | 飞书审批伪造 | 拿到审批群成员账号的攻击者 | 群成员=审批人;人事流程管拉群 |
+| Slack 审批伪造 / 越权 | 能打开审批频道的任何工作区成员、外部共享频道的外部成员 | 点击时实时校验:当前频道成员(不缓存)、非机器人、频道非外部共享、可选 stage 白名单、默认禁止自批;任一查询失败即拒绝 |
+| Slack 自批 | 申请人本人 | 申请人身份取多来源并集;映射不出来时只认"能证明自己不是申请人"的已登记成员(见下文) |
+| 往审批消息里注入提及 / 伪装链接 | 拿到 `RELEASE_TOKEN` 的攻击者(notes 等是自由文本) | 所有外部文本进 Slack mrkdwn 前转义 `& < >`;只有校验过形状的频道 / 用户 ID 才渲染成提及 |
+| Slack token 泄漏 | 拿到 approvo 环境变量的攻击者 | 只有 5 个 bot scope(不读消息、不发私信);token 只走环境变量;启动错误信息不回显 token |
 | GitHub App token 泄漏 | 拿到 `GITHUB_APP_PRIVATE_KEY` 的攻击者 | token 缩到单仓库 + 只 `actions:write`,50min 自动轮换 |
 | kubeconfig 泄漏 | 拿到 approvo 容器 shell 的攻击者 | 受限 SA (只对目标 ns 的 deployment 有 patch + rollout);建议 method=github 完全不放 |
 | SQLite 数据篡改 | 拿到 PVC 或 pod shell 的攻击者 | 部署凭证不在 SQLite;篡改 spec_json 影响本次部署,不影响历史部署 |
@@ -57,9 +61,30 @@ approvo 不需要飞书事件的公网入站入口:
 
 **如果内网出方向被防火墙限制**:开个白名单 `*.feishu.cn:443` 出方向即可.
 
+### 3b. Slack Socket Mode (出方向)
+
+`APPROVAL_PROVIDER=slack` 时同样**只出站**:`slack.com:443`(Web API + `apps.connections.open`)
+与它返回的 `wss://` 地址(`*.slack.com:443`)。不需要公网回调地址、不需要 Signing Secret ——
+Socket Mode 连接本身由 app-level token 认证,事件只会推给这条连接。
+
+与飞书的关键差异:**Slack 没有平台侧的审批对象,"谁有权批"完全由 approvo 判定**,
+所以点击鉴权必须 fail-close(见 [SLACK.md](SLACK.md#审批规则)):
+
+- **成员关系实时查、不缓存**:踢出审批频道 = 立即撤销审批权。公开频道里任何工作区成员都能看到消息、
+  点到按钮,所以"能点到"不构成身份,必须查成员。
+- **拒绝外部共享频道**:Slack Connect 频道的成员列表里有别家公司的人。
+- **禁止自批**(默认开):申请人映射不出来时,只接受在 `slack.user_map` 里登记过、且登记的 GitHub 账号
+  不是该申请人的成员;请求连 `github_actor` 都没有时谁都批不了。
+  ⚠️ 申请人身份来自 CI 上报,可信度等于调用方 workflow 的可信度(与飞书模式相同)。
+- **映射只在 config 里**:slack 模式下 `/admin` 映射编辑器 501。映射直接决定自批判定,
+  不该能被一个 Basic Auth 口令热改;改动走 git 审查。
+- **批准、拒绝都是 CAS**:两个人同一秒分别点批准和拒绝,只有一个生效。
+- **每次建连前自检** bot token 与频道(机器人在频道里、频道非外部共享):这些坏了 Socket Mode 照样连得上,
+  不自检就是又一个"/healthz 绿 ≠ 审批能用"。
+
 ### 4. 事件重放 / 事件重复
 
-飞书长连接偶发会重发事件.approvo 用 `try_claim_for_deploy(instance_code)` 做原子 CAS:
+飞书长连接偶发会重发事件(Slack 侧则是重复点击 / 多人同时点 / envelope 重投).approvo 用 `try_claim_for_deploy(instance_code)` 做原子 CAS:
 
 ```sql
 UPDATE releases SET status='deploying' 
@@ -88,7 +113,7 @@ UPDATE releases SET status='deploying'
 
 ### 秘钥轮换
 
-- 飞书 App Secret / GitHub App private key / `RELEASE_TOKEN` / `ADMIN_PASSWORD` **必须定期轮换**(建议每 90 天)
+- 飞书 App Secret / Slack bot & app token / GitHub App private key / `RELEASE_TOKEN` / `ADMIN_PASSWORD` **必须定期轮换**(建议每 90 天)
 - 轮换步骤:改 secret → `kubectl rollout restart deploy/approvo` → 验证 `/healthz`
 - 长连接会自动重连 (新 secret 生效)
 

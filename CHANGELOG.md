@@ -16,6 +16,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Slack 单卡模式**:未另配 `result_channel` 时,不再另发「部署中 / 结果 / 被拒」消息,只更新审批那一条,
+  卡上留时间线(发起 → 批准 → 部署中 → 完成),失败附日志尾部;部署结束(成功 / 失败)在该消息线程里回复并
+  @ 申请人和审批人(改消息不推送通知)。另配结果频道时行为不变。
+
+- **Slack 审批提供方(`APPROVAL_PROVIDER=slack`,Socket Mode)**。默认仍是 `feishu`,飞书路径行为不变;
+  两种模式互不要求对方的配置,未知取值拒绝启动。见 [docs/SLACK.md](docs/SLACK.md)。
+  - 只出站(Socket Mode WSS),不需要公网回调地址;凭据 `SLACK_BOT_TOKEN`(xoxb-)/ `SLACK_APP_TOKEN`(xapp-)
+    只走环境变量,缺失或前缀不对**拒绝启动**。Bot scope 仅 `chat:write`、`channels:read`、`groups:read`、
+    `users:read`、`users:read.email`。新增依赖 `slack_sdk==3.45.0`(无传递依赖)。
+  - `/release` 在审批频道发 Block Kit 审批消息(变更清单 / 数据库变更 / 环境变更与飞书卡片同源),
+    「批准」「拒绝」都带 confirm 弹窗;发不出去 → 置 `failed` + 502,不留静默积压的 pending。
+  - 点击时实时鉴权、任何查询失败即拒绝:审批频道**当前**成员(分页拉全、不缓存)、非机器人、
+    频道非 Slack Connect 外部共享、可选 `slack.approvers` 按 stage 白名单、默认**禁止自批**
+    (申请人映射不出来时只接受 `slack.user_map` 里登记过且不是该申请人的成员)。被拒原因以仅自己可见的消息告知。
+  - 状态机与部署复用:批准 = 既有 `try_claim_for_deploy` CAS,拒绝 = 新增 `store.try_transition`
+    (pending→rejected,同为单条 UPDATE 的 CAS),部署走同一个 `events._run_deploy`。
+  - 事件先 ack(3 秒内)再丢后台线程处理;Socket Mode 连接有与飞书同构的监督循环(退避重建、
+    稳定后归零、建连前自检 bot token 与频道),健康状态进同一个 `wshealth`,日志关键字仍是 `[ws][down]`。
+  - 飞书专属端点(`/viewer-token`、`/viewer-panel`、`/secret/*`、`/release-key`、`/admin` 与映射 API)
+    在 slack 模式下返回 **501** 并说明原因;`/deploy-credential` 等与 IM 无关的通道照常。
 - **`app/wshealth.py`:把「审批链路是否真的可用」变成可判据的东西**。`cli.start()` 是阻塞调用、SDK 不给"已连上"回调,故取「`start()` 正在阻塞中且未抛异常」为最强信号,并额外要求**已持续 `GRACE_SEC`(15s)** —— 无效凭证在几百毫秒内就 raise,撑不过这个门槛。fail-close:`init` / `starting` / `crashed` 一律判不健康。状态只放内存(它描述本进程当前连接,落库反而会让上个进程的状态污染新进程)。
 - **`GET /readyz`(能力探针)**:长连接不可用 → 503。`GET /healthz` 语义收敛为 **liveness,恒 200**,但 body 带 `ws` 真实状态(不再是硬编码 `{"ok":true}`)。
   - ⚖️ 为什么 `/healthz` 不许变红:容器编排的 readinessProbe 通常指着它,红了实例会被摘出服务发现 → 连 `/admin` 和日志入口都够不到、现场无法诊断,而 CI 只会看到"连不上 gate"这种无信息量的错误。**外部监控/拨测指 `/readyz`,不要把 readinessProbe 改过来。**

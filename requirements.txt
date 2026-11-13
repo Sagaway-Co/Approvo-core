@@ -15,3 +15,6 @@ requests==2.34.2
 PyJWT[crypto]==2.13.0
 psycopg[binary,pool]==3.3.4
 tzdata==2026.3
+# APPROVAL_PROVIDER=slack 用(Socket Mode 内置 WebSocket 实现,无额外依赖)。
+# 3.45.0 = 2026-10-01 发布的稳定版,刻意不取当时最新(发布不足两周)的 3.46.0。
+slack_sdk==3.45.0
