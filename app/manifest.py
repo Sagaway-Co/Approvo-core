@@ -13,6 +13,8 @@
           repo: my-monorepo                    # 省略则用 source_repo
           path: "releases/{tag}/release.yaml"  # 必须含 {tag}
           registry: "deploy/services.yaml"     # 可选:服务登记表,补出镜像名与工作负载名
+          optional: true                       # 可选:该 tag 没有清单文件时照常发审批(不渲染清单块);
+                                               #       文件存在时仍按下面的 fail-close 规则校验
 
 清单文件(YAML):
 

@@ -303,11 +303,14 @@ def _collect_manifest(rel: dict, req: "ReleaseReq") -> dict | None:
         raise HTTPException(409, "release_manifest 配置必须是映射(repo / path / registry)")
     repo = cfg.get("repo") or rel.get("source_repo") or req.repo
     try:
-        m = github.release_manifest(repo, cfg.get("path"), req.git_tag or req.tag, cfg.get("registry"))
+        m = github.release_manifest(repo, cfg.get("path"), req.git_tag or req.tag, cfg.get("registry"),
+                                    optional=cfg.get("optional") is True)
     except (manifest.ManifestError, github.AppInstallLookupError) as e:
         raise HTTPException(409, f"发布清单不可用(fail-close,不发审批):{e}")
     except Exception as e:  # 宽捕获是有意的(BLE001 已在 ruff.toml 全局 ignore)
         raise HTTPException(502, f"发布清单读取失败(fail-close,不发审批):{type(e).__name__}: {e}")
+    if m is None:
+        return None   # optional 且本 tag 没有清单文件:卡片回落到旧的「镜像 + 环境变更」两块
     m["image_repo"] = rel.get("image_repo") or ""
     return m
 

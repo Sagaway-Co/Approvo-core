@@ -535,7 +535,8 @@ def _file_at(repo: str, path: str, ref: str, max_bytes: int) -> str | None:
         raise manifest.ManifestError(f"{path} 不是 UTF-8 文本") from None
 
 
-def release_manifest(repo: str, path_template: str, tag: str, registry: str | None = None) -> dict:
+def release_manifest(repo: str, path_template: str, tag: str, registry: str | None = None,
+                     optional: bool = False) -> dict | None:
     """按 tag 读发布清单(见 app/manifest.py),供审批卡精确显示本次发布的服务 / 迁移 / 配置。
 
     🔴 所有文件都钉在【tag 解析出的同一个 commit】上读:先解 tag 再按 sha 取,
@@ -551,6 +552,8 @@ def release_manifest(repo: str, path_template: str, tag: str, registry: str | No
         raise manifest.ManifestError(f"tag `{tag}` 在 {repo} 上不存在")
     text = _file_at(repo, path, sha, manifest.MAX_BYTES)
     if text is None:
+        if optional:
+            return None   # optional:这个 tag 没写清单 = 本次没有清单里的内容(部署侧读同一路径,同样视为没有)
         raise manifest.ManifestError(f"发布清单 {path} 在 tag `{tag}` 上不存在")
     m = manifest.parse_manifest(text)
     base = path.rsplit("/", 1)[0] if "/" in path else ""

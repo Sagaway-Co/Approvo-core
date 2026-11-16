@@ -142,6 +142,16 @@ def test_secrets_are_listed_with_fingerprints_but_no_ciphertext():
             manifest.parse_manifest("services: []\n" + bad + "\n")
 
 
+def test_optional_manifest_missing_file_returns_none(gh):
+    """optional:tag 存在但没有清单文件 → None(照常发审批);文件存在仍正常解析;tag 不存在仍报错。"""
+    from app import github, manifest
+    assert github.release_manifest("my-monorepo", "releases/{tag}/missing.yaml", TAG, optional=True) is None
+    with pytest.raises(manifest.ManifestError, match="不存在"):
+        github.release_manifest("my-monorepo", "releases/{tag}/missing.yaml", TAG)
+    m = github.release_manifest("my-monorepo", "releases/{tag}/release.yaml", TAG, "deploy/services.yaml", optional=True)
+    assert m["status"] == "ok" and [s["name"] for s in m["services"]] == ["svc-a", "svc-b"]
+
+
 def test_migration_danger_is_scanned_from_file_content(gh):
     m = _read()
     assert m["migrations"][0]["danger"] == []
@@ -258,8 +268,8 @@ def test_server_collect_maps_github_outage_to_502(monkeypatch):
 def test_server_collect_uses_source_repo_and_git_tag(monkeypatch):
     got = {}
 
-    def fake(repo, path, tag, registry):
-        got.update(repo=repo, path=path, tag=tag, registry=registry)
+    def fake(repo, path, tag, registry, optional=False):
+        got.update(repo=repo, path=path, tag=tag, registry=registry, optional=optional)
         return {"status": "ok", "services": []}
     monkeypatch.setattr(github, "release_manifest", fake)
     rel = {"source_repo": "my-org/my-monorepo", "image_repo": "registry.example.com/ns",
@@ -267,5 +277,12 @@ def test_server_collect_uses_source_repo_and_git_tag(monkeypatch):
     req = server.ReleaseReq(repo="my-monorepo", tag="img-tag", git_tag=TAG)
     m = server._collect_manifest(rel, req)
     assert got == {"repo": "my-org/my-monorepo", "path": "releases/{tag}/release.yaml", "tag": TAG,
-                   "registry": "deploy/services.yaml"}
+                   "registry": "deploy/services.yaml", "optional": False}
     assert m["image_repo"] == "registry.example.com/ns"
+    # optional: true 只认布尔 true;清单缺失(github 返回 None)时 _collect_manifest 返回 None,照常发审批
+    monkeypatch.setattr(github, "release_manifest", lambda *a, **k: got.update(optional=k.get("optional")))
+    rel["release_manifest"]["optional"] = True
+    assert server._collect_manifest(rel, req) is None and got["optional"] is True
+    rel["release_manifest"]["optional"] = "yes"
+    server._collect_manifest(rel, req)
+    assert got["optional"] is False
