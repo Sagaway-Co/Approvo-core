@@ -21,6 +21,10 @@
       - {database: main_db, file: migrations/001_add_x.sql}
     configmaps: [deploy/cm/svc-a.yaml] # 可选;仓库内路径
     deployments: [deploy/app/svc-a.yaml]  # 可选;要同步环境变量的工作负载清单(只展示,执行在流水线)
+    secrets:                           # 可选;要新增 / 修改键的 Secret,值是加密密文(只展示名字、键与指纹)
+      - name: svc-a-secrets
+        keys:
+          API_KEY: {sha256: "0123456789ab", sealed: "<base64 密文>"}
     notes: 一句话说明                   # 可选
 
 登记表(可选):`services.<name>.image` 与 `services.<name>.deploy[].deployment`。
@@ -41,11 +45,16 @@ REGISTRY_MAX_BYTES = 256 * 1024  # 服务登记表
 MAX_SERVICES = 50
 MAX_MIGRATIONS = 50
 MAX_CONFIGMAPS = 50
+MAX_SECRETS = 20
+MAX_SECRET_KEYS = 50
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 _IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,199}")
 _TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _PATH_SEG_RE = re.compile(r"[A-Za-z0-9._-]{1,200}")
+_SECRET_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
+_SECRET_KEY_RE = re.compile(r"[-._A-Za-z0-9]{1,253}")
+_FINGERPRINT_RE = re.compile(r"[0-9a-f]{8,64}")
 
 
 class ManifestError(ValueError):
@@ -121,11 +130,41 @@ def parse_manifest(text: str) -> dict:
     # 可选:本次要同步环境变量(env / envFrom)的工作负载清单文件。只展示,执行与校验在部署流水线
     deployments = [safe_rel_path(d, "Deployment 清单路径")
                    for d in _list(data, "deployments", MAX_CONFIGMAPS)]
+    secrets = _secrets(data)
     notes = data.get("notes")
     if notes is not None and not isinstance(notes, (str, int, float)):
         raise ManifestError("清单的 notes 必须是一行文本")
     return {"services": services, "migrations": migrations, "configmaps": configmaps,
-            "deployments": deployments, "notes": "" if notes is None else str(notes).strip()}
+            "deployments": deployments, "secrets": secrets, "notes": "" if notes is None else str(notes).strip()}
+
+
+def _secrets(data: dict) -> list:
+    """可选的 secrets:要新增 / 修改键的 Secret。值是加密密文,卡片上只放名字、键名与明文指纹(sha256 前若干位),
+    密文本身不进卡片。解密、核对指纹与写入都在部署流水线。
+    → [{"name": str, "keys": [{"name": str, "sha256": str}…]}…]"""
+    out, seen = [], set()
+    for s in _list(data, "secrets", MAX_SECRETS):
+        if not isinstance(s, dict) or set(s) != {"name", "keys"}:
+            raise ManifestError(f"清单 secrets 每项只能有 name / keys:{s!r}"[:300])
+        name, keys = s["name"], s["keys"]
+        if not isinstance(name, str) or not _SECRET_NAME_RE.fullmatch(name):
+            raise ManifestError(f"清单 secrets 里有不合法的 Secret 名:{name!r}")
+        if name in seen:
+            raise ManifestError(f"清单 secrets 里 {name} 重复")
+        seen.add(name)
+        if not isinstance(keys, dict) or not keys or len(keys) > MAX_SECRET_KEYS:
+            raise ManifestError(f"清单 secrets 的 {name}:keys 必须是 1~{MAX_SECRET_KEYS} 个键的映射")
+        items = []
+        for k, v in keys.items():
+            if not isinstance(k, str) or not _SECRET_KEY_RE.fullmatch(k):
+                raise ManifestError(f"清单 secrets 的 {name}:键名不合法:{k!r}")
+            if not isinstance(v, dict) or set(v) != {"sha256", "sealed"} or not isinstance(v["sealed"], str) or not v["sealed"]:
+                raise ManifestError(f"清单 secrets 的 {name}.{k}:只能有 sha256 / sealed 两项")
+            if not isinstance(v["sha256"], str) or not _FINGERPRINT_RE.fullmatch(v["sha256"]):
+                raise ManifestError(f"清单 secrets 的 {name}.{k}:sha256 必须是十六进制指纹")
+            items.append({"name": k, "sha256": v["sha256"]})
+        out.append({"name": name, "keys": items})
+    return out
 
 
 def parse_registry(text: str, services: list[str]) -> dict:

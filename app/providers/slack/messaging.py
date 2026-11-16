@@ -217,6 +217,12 @@ def _manifest(spec: dict) -> str | None:
     if deps:
         lines.append(f"*🧱 工作负载环境变量变更({len(deps)},按清单同步 env / envFrom)*")
         lines += [f"· {file_link(str(d))}" for d in deps[:15]]
+    secs = m.get("secrets") or []
+    if secs:
+        lines.append(f"*🔐 Secret 新增 / 修改({len(secs)},值已加密,核对键名与指纹)*")
+        for sc in secs[:10]:
+            ks = "、".join(f"{_code(k.get('name'))} 指纹 {_code(k.get('sha256'))}" for k in (sc.get("keys") or [])[:15])
+            lines.append(f"· *{esc(sc.get('name'))}*:{ks}")
     if m.get("notes"):
         lines.append(f"*说明*:{esc(_clip(str(m['notes']), 300))}")
     return "\n".join(lines)

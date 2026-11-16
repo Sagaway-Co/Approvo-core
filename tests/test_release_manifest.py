@@ -111,6 +111,37 @@ def test_card_without_links_falls_back_to_code():
     assert "`r/x.yaml`" in dump and "`c.yaml`" in dump and "<http" not in dump
 
 
+def test_secrets_are_listed_with_fingerprints_but_no_ciphertext():
+    """secrets 只把 Secret 名、键名、指纹放上卡;密文不进卡片。格式不对 fail-close。"""
+    from app import cards, manifest
+    text = MANIFEST + """secrets:
+  - name: svc-b-secrets
+    keys:
+      API_KEY:
+        sha256: "0123456789ab"
+        sealed: "Q0lQSEVSVEVYVA=="
+      OTHER_KEY: {sha256: "ba9876543210", sealed: "QU5PVEhFUg=="}
+"""
+    m = manifest.parse_manifest(text)
+    assert m["secrets"] == [{"name": "svc-b-secrets", "keys": [{"name": "API_KEY", "sha256": "0123456789ab"},
+                                                                {"name": "OTHER_KEY", "sha256": "ba9876543210"}]}]
+    spec = {"repo": "r", "tag": TAG, "image": "x", "submit_time": "-",
+            "manifest": dict(m, status="ok", path="r/x.yaml", commit=SHA,
+                             services=[{"name": n, "image": None, "deployments": []} for n in m["services"]])}
+    for dump in (json.dumps(messaging.approval_message("slk-x", spec)[1], ensure_ascii=False),
+                 json.dumps(cards._manifest_block(spec), ensure_ascii=False)):
+        assert "svc-b-secrets" in dump and "API_KEY" in dump and "0123456789ab" in dump and "ba9876543210" in dump
+        assert "Q0lQSEVSVEVYVA" not in dump and "QU5PVEhFUg" not in dump
+    assert manifest.parse_manifest("services: []\nsecrets: []\n")["secrets"] == []
+    for bad, why in [("secrets: x", "必须是列表"), ("secrets:\n  - {name: A_B, keys: {K: {sha256: abcdef12, sealed: x}}}", "Secret 名"),
+                     ("secrets:\n  - {name: s, keys: {}}", "keys 必须是"),
+                     ("secrets:\n  - {name: s, keys: {K: {sha256: abcdef12}}}", "只能有 sha256 / sealed"),
+                     ("secrets:\n  - {name: s, keys: {K: {sha256: xyz, sealed: x}}}", "十六进制"),
+                     ("secrets:\n  - {name: s, keys: {K: {sha256: abcdef12, sealed: x}}}\n  - {name: s, keys: {K: {sha256: abcdef12, sealed: x}}}", "重复")]:
+        with pytest.raises(manifest.ManifestError, match=why):
+            manifest.parse_manifest("services: []\n" + bad + "\n")
+
+
 def test_migration_danger_is_scanned_from_file_content(gh):
     m = _read()
     assert m["migrations"][0]["danger"] == []

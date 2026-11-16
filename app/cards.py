@@ -162,6 +162,12 @@ def _manifest_block(spec: dict) -> dict | None:
     if deps:
         lines.append(f"**🧱 工作负载环境变量变更({len(deps)},按清单同步 env / envFrom)**\n"
                      + "\n".join(f"· {file_link(str(d))}" for d in deps[:15]))
+    secs = m.get("secrets") or []
+    if secs:
+        lines.append(f"**🔐 Secret 新增 / 修改({len(secs)},值已加密,核对键名与指纹)**")
+        for sc in secs[:10]:
+            ks = "、".join(f"`{_md_safe(k.get('name'))}` 指纹 `{_md_safe(k.get('sha256'))}`" for k in (sc.get("keys") or [])[:15])
+            lines.append(f"· **{_md_safe(sc.get('name'))}**:{ks}")
     if m.get("notes"):
         lines.append(f"**说明**:{_md_safe(str(m['notes']))[:300]}")
     return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}
