@@ -79,8 +79,10 @@ def _run_deploy(instance_code: str, spec: dict, approver_name):
     差别只在通知发到哪个平台(_notify_*)。
     """
     _notify_deploying(spec, approver_name)
+    # 审批单号随部署走(兑换券 → 流水线 → 迁移台账的 approval_ref);原来 spec 里没有它,台账只记了 "-"
+    deploy_spec = spec if spec.get("instance_code") else dict(spec, instance_code=instance_code)
     try:
-        ok, log = get_deployer(spec.get("method", "kubectl")).deploy(spec)
+        ok, log = get_deployer(spec.get("method", "kubectl")).deploy(deploy_spec)
     except Exception as e:  # 兜底:部署器任何异常都要可见(BLE001 已在 ruff.toml 全局 ignore)
         ok, log = False, f"部署异常({type(e).__name__}): {e}"
         traceback.print_exc()
