@@ -141,16 +141,19 @@ def test_poll_survives_read_timeouts_and_reports_job_errors(monkeypatch):
     monkeypatch.setattr(github.time, "sleep", lambda s: None)
     monkeypatch.setattr(github, "_headers", lambda repo: {})
     monkeypatch.setattr(k8s, "deploy_target_allowed", lambda c, n: None)
-    calls = {"run": 0}
+    calls = {"run": 0, "dispatched": False}
     title = "deploy demo v1.0.0 (prod)"
 
     def fake_post(url, **kw):
+        calls["dispatched"] = True
         return _Resp(204)
 
     def fake_get(url, **kw):
         if url.endswith("/runs") and "workflows" in url:
-            return _Resp(200, {"workflow_runs": [{"id": 7, "html_url": "https://github.com/x/r/actions/runs/7",
-                                                  "display_title": title}]})
+            # 派发前没有同名 run;派发后出现 run 7(只认派发后新出现的 run)
+            runs = [{"id": 7, "html_url": "https://github.com/x/r/actions/runs/7",
+                     "display_title": title}] if calls["dispatched"] else []
+            return _Resp(200, {"workflow_runs": runs})
         if url.endswith("/actions/runs/7"):
             calls["run"] += 1
             if calls["run"] <= 2:
