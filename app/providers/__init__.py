@@ -1,6 +1,7 @@
 """审批平台适配器抽象层.
 
-approvo 目前仅内置飞书 provider,后续可扩展为钉钉 / Slack / 企微 等.
+approvo 内置飞书(默认)与 Slack provider,由环境变量 APPROVAL_PROVIDER 选择;
+后续可扩展为钉钉 / 企微 等.
 新增 provider 请见 docs/PROVIDERS.md.
 """
 from abc import ABC, abstractmethod
@@ -45,6 +46,10 @@ class ApprovalProvider(ABC):
 
 
 def get_provider() -> ApprovalProvider:
-    """provider 工厂.当前仅支持飞书;后续按 settings.PROVIDER 分派."""
+    """provider 工厂:按 settings.APPROVAL_PROVIDER 分派(feishu 默认 / slack)."""
+    from app import settings
+    if settings.APPROVAL_PROVIDER == "slack":
+        from app.providers.slack import SlackProvider
+        return SlackProvider()
     from app.providers.feishu import FeishuProvider
     return FeishuProvider()

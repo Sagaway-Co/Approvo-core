@@ -1,13 +1,35 @@
 # Approval Providers
 
-Approvo 通过 `ApprovalProvider` ABC 支持替换审批平台.当前内置:
+Approvo 通过 `ApprovalProvider` ABC 支持替换审批平台,由环境变量 `APPROVAL_PROVIDER` 选择
+(`feishu` 默认 / `slack`;未知取值拒绝启动).当前内置:
 
 | Provider | 状态 | 特性 |
 | --- | --- | --- |
 | feishu (飞书) | ✅ Ready | 长连接、动态审批人、审批实例、消息卡片 |
+| slack | ✅ Ready | Socket Mode(只出站)、Block Kit 审批消息 + 批准/拒绝按钮、审批人 = 审批频道当前成员、禁止自批、按 stage 白名单。见 [SLACK.md](SLACK.md) |
 | wecom (企微) | 🚧 未实现 | 参考 another-app 旧实现(WeCom OA API + FC webhook) |
 | dingtalk (钉钉) | 🚧 未实现 | 类似飞书但 API 有差异 |
-| slack | 🚧 未实现 | 交互按钮 + Events API 或 Socket Mode |
+
+## Slack provider 要点
+
+代码在 [`app/providers/slack/`](../app/providers/slack/),布局即下文"新增 Provider 步骤"推荐的那套
+(`client` / `messaging` / `approval` / `events`)。与飞书的根本差异:
+
+- **没有平台侧的"审批实例"**。实例号由 approvo 生成(`slk-<uuid>`),审批状态只存在 approvo 自己的库里;
+  因此不需要订阅、也不需要启动对账 —— 不存在"平台上已决策、我们没收到"的情况
+  (连接不在时点击会在 Slack 端当场失败,状态保持 pending,重连后可再点)。
+- **"谁能批"不再由平台把关,全部落在 approvo 的点击鉴权上**,而且是 fail-close 的:
+  审批频道当前成员(不缓存)、非机器人、频道非外部共享、可选的 stage 白名单、默认禁止自批。
+  规则与"申请人映射不出来"时的策略见 [SLACK.md](SLACK.md#审批规则)。
+- **状态机与部署完全复用**:批准 = `store.try_claim_for_deploy`(pending→deploying),
+  拒绝 = `store.try_transition`(pending→rejected),两个都是 CAS;部署走 `events._run_deploy`,
+  与飞书 / 审批直通是同一个函数,只是通知发到 Slack。
+- **Socket Mode 事件先 ack 再处理**(Slack 要求 3 秒内确认),处理丢后台线程。
+- **连接监督循环**与飞书长连接同构:崩了退避重建(2s 起、指数、上限 300s,稳定 ≥60s 后归零),
+  健康状态进同一个 `wshealth`(`/healthz`、`/readyz`、`/release` 的 fail-close 判据不变),
+  日志关键字仍是 `[ws][down]`(附 `provider=slack`)。每次建连前自检 bot token 与频道,
+  因为这两样坏了 Socket Mode 照样连得上。
+- 飞书专属端点(只读凭证、Secret 变更、发版密钥、`/admin` 映射页)在 slack 模式下返回 **501**。
 
 ## ApprovalProvider 契约
 
@@ -42,7 +64,9 @@ class ApprovalProvider(ABC):
 - **`query_status`** 返回 dict,至少含 `status` (`APPROVED` / `REJECTED` / `CANCELED` / `DELETED` / `PENDING` 等) 与 `timeline` (审批事件列表)
 - **`send_card`** 卡片格式当前是飞书 msg card json;后续可能抽象出 `Card` DTO,provider 自己渲染
 - **`list_chat_members`** 返回 user_id 列表,过滤掉机器人 / 无 user_id 的成员
-- **事件监听**:目前长连接绑定在 `app/main.py` 里直接用 lark-oapi SDK;后续应移到 provider 内部,ABC 增加 `run_event_listener()` 方法
+- **事件监听**:飞书长连接绑定在 `app/main.py` 里直接用 lark-oapi SDK;Slack 的 Socket Mode 监督循环在
+  `app/providers/slack/events.py`,由 `app/main.py` 按 `APPROVAL_PROVIDER` 选择启动。
+  后续可统一成 ABC 上的 `run_event_listener()` 方法
 
 ## 新增 Provider 步骤
 
@@ -77,14 +101,15 @@ class DingtalkProvider(ApprovalProvider):
 
 ```python
 def get_provider() -> ApprovalProvider:
-    provider_type = os.environ.get("APPROVAL_PROVIDER", "feishu")
-    if provider_type == "feishu":
-        from app.providers.feishu import FeishuProvider
-        return FeishuProvider()
-    if provider_type == "dingtalk":
+    from app import settings                 # APPROVAL_PROVIDER 在 settings 里校验过
+    if settings.APPROVAL_PROVIDER == "slack":
+        from app.providers.slack import SlackProvider
+        return SlackProvider()
+    if settings.APPROVAL_PROVIDER == "dingtalk":   # 新 provider:同时把取值加进 settings 的白名单
         from app.providers.dingtalk import DingtalkProvider
         return DingtalkProvider()
-    raise ValueError(f"unknown provider: {provider_type}")
+    from app.providers.feishu import FeishuProvider
+    return FeishuProvider()
 ```
 
 ### 4. 事件监听
@@ -93,7 +118,7 @@ def get_provider() -> ApprovalProvider:
 - 飞书:长连接 (lark-oapi SDK,出方向)
 - 钉钉:HTTP webhook (需公网入口,provider 提供 verify + decrypt)
 - 企微:HTTP webhook (类似钉钉,加密 XML)
-- Slack:HTTP Events API 或 Socket Mode (推荐 Socket Mode,出方向)
+- Slack:Socket Mode (出方向,已实现,见 `app/providers/slack/events.py`)
 
 如果 provider 走 webhook,建议加一个 FastAPI 路由 `/webhook/<provider>`,在 provider 内部注册路由:
 

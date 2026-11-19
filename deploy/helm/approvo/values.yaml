@@ -17,9 +17,12 @@ replicaCount: 1
 ##   2) existingSecret == "" 且 secrets.* 有值 → chart 自建 secret (demo 用)
 existingSecret: ""
 secrets:
-  FEISHU_APP_ID: ""
+  APPROVAL_PROVIDER: ""         # feishu(留空=默认)/ slack;slack 时 config 需有 slack: 段,见 docs/SLACK.md
+  FEISHU_APP_ID: ""             # 仅 feishu 模式
   FEISHU_APP_SECRET: ""
   LARK_ENDPOINT: "feishu"       # feishu(国内, open.feishu.cn) / lark(海外, open.larksuite.com) / 或完整 URL
+  SLACK_BOT_TOKEN: ""           # 仅 slack 模式:xoxb-…(生产请用 existingSecret,别把 token 写进 values)
+  SLACK_APP_TOKEN: ""           # 仅 slack 模式:xapp-…(connections:write,Socket Mode 用)
   RELEASE_TOKEN: ""             # /release 接口的共享密钥;留空=不校验
   PUBLIC_GATE_URL: ""           # 对外入口(仅用于在提示信息里拼可复制的 curl);留空=提示里显示占位符
   ENABLE_DOCS: ""               # 置 1 才暴露 /docs、/redoc、/openapi.json;默认关(fail-close)
@@ -30,6 +33,7 @@ secrets:
   GITHUB_APP_PRIVATE_KEY: ""    # PEM 全文,多行,helm --set-file 传
 
 ## ConfigMap 内容 (推荐用 --set-file config=/path/to/config.yaml 覆盖)
+## slack 模式:把 feishu: 换成 slack: {approval_channel: "C0XXXXXXX", ...}(见 config.example.yaml)
 config:
   feishu:
     approval_code: "<YOUR_APPROVAL_CODE>"

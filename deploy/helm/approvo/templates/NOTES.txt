@@ -18,7 +18,15 @@ Quick check:
   curl -s http://localhost:8700/healthz | jq
 
 Next steps:
+{{- if eq (default "feishu" .Values.secrets.APPROVAL_PROVIDER) "slack" }}
+  1. 按 docs/SLACK.md 建 Slack App(Socket Mode + 5 个 bot scope),把机器人 /invite 进审批频道
+  2. config.yaml 的 slack: 段填审批频道 ID / user_map,helm upgrade --set-file config=config.yaml
+  3. 确认 curl /readyz 为 200(日志里有 "[slack][up] Socket Mode 已连接")
+  4. 在业务仓的 .github/workflows/release.yml 里 curl POST /release
+{{- else }}
   1. 在飞书自建应用后台配置事件订阅 (approval_instance) + 权限 scopes
   2. 用 scripts/create_approval.py 生成审批定义,拿到 approval_code
   3. 用 helm upgrade --set-file config=config.yaml 更新 releases 清单
   4. 在业务仓的 .github/workflows/release.yml 里 curl POST /release
+  (用 Slack 审批:设 APPROVAL_PROVIDER=slack,见 docs/SLACK.md)
+{{- end }}

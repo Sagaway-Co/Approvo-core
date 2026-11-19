@@ -1,6 +1,7 @@
 """入口:启动长连接事件监听 + HTTP 服务。
 
 长连接客户端 .start() 是阻塞的,丢后台线程跑;HTTP 用 uvicorn 在主线程跑。
+APPROVAL_PROVIDER=slack 时改走 Slack Socket Mode(见 _main_slack 与 app/providers/slack/events.py)。
 """
 import threading
 import time
@@ -66,7 +67,24 @@ def _run_ws():
         backoff = min(backoff * 2, _BACKOFF_MAX)
 
 
+def _main_slack():
+    """slack 模式入口:Socket Mode 监督循环(后台线程)+ HTTP(主线程)。
+
+    ⚖️ 不订阅、不做启动对账 —— 不是省略,是没有对象:
+    Slack 没有平台侧的"审批实例",审批状态只存在 approvo 自己的库里;「批准 / 拒绝」是人
+    点按钮时经 Socket Mode 同步送达的。连接不在时点击会在 Slack 端当场失败(点的人看得见),
+    状态保持 pending,重连后按钮照样能点 —— 不存在"平台上已决策、我们没收到"需要补的情况。
+    """
+    from app.providers.slack.events import run_supervisor
+    threading.Thread(target=run_supervisor, daemon=True).start()
+    print(f"[main] http listening on :{settings.PORT}, slack socket mode supervisor started")
+    uvicorn.run("app.server:app", host="0.0.0.0", port=settings.PORT, log_level="info")
+
+
 def main():
+    if settings.APPROVAL_PROVIDER == "slack":
+        _main_slack()
+        return
     # 启动即订阅审批事件(幂等)。不订阅就收不到 approval_instance。
     try:
         feishu.subscribe(settings.APPROVAL_CODE)

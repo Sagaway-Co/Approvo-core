@@ -286,3 +286,22 @@ def try_claim_for_deploy(instance_code: str) -> bool:
             (_now(), instance_code),
         )
         return cur.rowcount == 1
+
+
+def try_transition(instance_code: str, from_status: str, to_status: str) -> bool:
+    """原子 CAS:仅当当前状态为 from_status 时改成 to_status。返回 True = 本次抢到。
+
+    为什么需要它(而不是 set_status):飞书的决策来自审批实例的【唯一终态】,不存在
+    "同时又批又拒";而 Slack 的「批准」「拒绝」是同一条消息上的两个按钮,两个人可以
+    在同一秒分别点下去。若拒绝走无条件的 set_status,就可能把已被认领、正在部署的
+    deploying 覆盖成 rejected —— 界面显示"已拒绝",而部署其实在跑。
+    🔴 与 try_claim_for_deploy 同理:单条 UPDATE ... WHERE status=? 靠行级锁保证原子,
+    不要拆成"先 select 再 update"。
+    """
+    with _conn() as c:
+        cur = c.execute(
+            "update releases set status=%s, updated_at=%s "
+            "where instance_code=%s and status=%s",
+            (to_status, _now(), instance_code, from_status),
+        )
+        return cur.rowcount == 1

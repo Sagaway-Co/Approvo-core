@@ -157,6 +157,23 @@ UPDATE releases SET status='deploying', updated_at=?
 - 仍未归属的列为"未关联 PR 的直接提交"
 - 用**只读 App token**(缩到目标源码仓 + `contents:read + pull_requests:read`),按仓库缓存 50min
 
+## Slack provider (APPROVAL_PROVIDER=slack)
+
+同一个状态机、同一条部署路径,只换"审批从哪来":
+
+```
+CI ──POST /release──► approvo: 鉴权/限流/防重 → store.save(slk-<uuid>, pending)
+                              → chat.postMessage(审批频道, Block Kit + 批准/拒绝按钮)
+审批频道成员点按钮 ──Socket Mode──► 立即 ack → 后台线程:
+      实时校验(当前成员 / 非 bot / 非外部共享 / stage 白名单 / 禁止自批)
+      ├─ 批准: try_claim_for_deploy (pending→deploying, CAS) → 改消息 → events._run_deploy → 改消息(最终态)
+      └─ 拒绝: try_transition (pending→rejected, CAS) → 改消息 → 结果频道通知
+```
+
+- 审批状态只在 approvo 库里(没有平台侧审批实例),所以**不订阅、不对账**
+- Socket Mode 连接由监督循环维护,健康状态与飞书共用 `wshealth`(`/readyz`、`/release` 判据不变)
+- 详见 [PROVIDERS.md](PROVIDERS.md#slack-provider-要点) 与 [SLACK.md](SLACK.md)
+
 ## 凭证隔离设计
 
 approvo 的部署路径设计成 **method=github**:approvo 不持 kubeconfig / cloud AK,只持 GitHub App private key + `actions:write` for 受限发版仓.

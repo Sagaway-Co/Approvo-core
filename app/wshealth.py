@@ -49,7 +49,7 @@ GRACE_SEC = 15.0
 
 _lock = threading.Lock()
 _st: dict = {
-    "state": "init",        # init / starting / running / crashed
+    "state": "init",        # init / starting / running / reconnecting(仅 Slack) / crashed
     "since": 0.0,           # 进入当前 state 的时刻
     "attempts": 0,          # 累计尝试建连次数
     "crashes": 0,           # 累计崩溃次数
@@ -70,6 +70,21 @@ def mark_running() -> None:
     with _lock:
         _st["state"] = "running"
         _st["since"] = time.time()
+
+
+def mark_reconnecting(err: str) -> None:
+    """连接建立过、现在断开、SDK 正在自动重连。
+
+    目前只有 Slack Socket Mode 用得上:它的客户端能直接回答 is_connected(),
+    而飞书 SDK 不给这个信号(见上方「判据怎么选」),所以飞书路径不会进入此态。
+    🔴 healthy() 只认 running ⇒ 此态一律判不健康(fail-close);不计入 crashes ——
+       它还没到"放弃、拆掉重建"那一步。
+    """
+    with _lock:
+        _st["state"] = "reconnecting"
+        _st["since"] = time.time()
+        _st["last_error"] = err[:300]
+        _st["last_error_at"] = time.time()
 
 
 def mark_crashed(err: str) -> None:

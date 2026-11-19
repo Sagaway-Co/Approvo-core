@@ -2,7 +2,7 @@
 #
 # 部署模型:
 # - approvo 走 GitHub workflow_dispatch 触发受限发版仓库的 deploy.yml;本身不持 kubeconfig,只持 GITHUB_APP token
-# - 事件走飞书长连接(出方向即可),无需入站公网
+# - 事件走飞书长连接 / Slack Socket Mode(APPROVAL_PROVIDER=slack)—— 都是出方向,无需入站公网
 # - /release 由公网入口反代进来(建议只放 /release 和 /healthz)
 # - /admin 只走内网 Ingress,结构性隔离
 #
@@ -19,6 +19,11 @@ metadata:
 #     --from-literal=ADMIN_PASSWORD=... \
 #     --from-literal=GITHUB_APP_ID=... --from-literal=GITHUB_APP_OWNER=your-org \
 #     --from-file=GITHUB_APP_PRIVATE_KEY=./app-private-key.pem
+#
+# 用 Slack 审批时:把 FEISHU_APP_ID / FEISHU_APP_SECRET 换成下面三项,
+# 并把下方 ConfigMap 里的 feishu: 段换成 slack: 段(见 config.example.yaml / docs/SLACK.md):
+#     --from-literal=APPROVAL_PROVIDER=slack \
+#     --from-literal=SLACK_BOT_TOKEN=xoxb-... --from-literal=SLACK_APP_TOKEN=xapp-...
 ---
 apiVersion: v1
 kind: ConfigMap

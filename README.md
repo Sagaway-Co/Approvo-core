@@ -1,6 +1,6 @@
 # approvo
 
-> Release approval gate for CI/CD pipelines · powered by Feishu (国内) / Lark (海外).
+> Release approval gate for CI/CD pipelines · powered by Feishu (国内) / Lark (海外) / Slack.
 > 打 tag → 审批 → 通过后自动部署.一个轻量、单副本、可开源的发版卡点服务.
 
 [![CI](https://github.com/Sagaway-Co/Approvo-core/actions/workflows/ci.yml/badge.svg)](https://github.com/Sagaway-Co/Approvo-core/actions/workflows/ci.yml)
@@ -13,8 +13,8 @@
 发版是团队里少数几个必须"人工把关 + 自动执行"的动作.现有的选择要么太重 (Spinnaker / ArgoCD Sync Policies),要么依赖公司内 IM 平台且事件链路脆弱 (企微 webhook + 定时 poll).
 
 approvo 的取舍:
-- **飞书长连接** — 无需公网入站入口,出方向能到 `open.feishu.cn:443` 即可
-- **动态审批人** — 审批人 = 审批群当前成员;拉/踢群 = 即时授权/撤销,不用改配置
+- **飞书长连接 / Slack Socket Mode** — 无需公网入站入口,只出站;`APPROVAL_PROVIDER=feishu|slack` 切换
+- **动态审批人** — 审批人 = 审批群(Slack:审批频道)当前成员;拉/踢群 = 即时授权/撤销,不用改配置
 - **原子状态机** — `try_claim_for_deploy` CAS 防重复部署,启动时对账一次补漏事件
 - **凭证隔离** — approvo 只调 GitHub `workflow_dispatch`,不持 kubeconfig;真实凭证只在受限发版仓
 - **变更清单** — 审批卡片自动列出 PR + 直接提交 + 作者,让 review 有事实基础
@@ -24,7 +24,7 @@ approvo 的取舍:
   绑定一次性对象的 SA token,部署结束回调撤销(暴露窗口 ≈ 部署时长 + 15 秒)
 - **fail-close 到底** — 目标白名单不配即整条通道关闭;`env` / `deploy` / `sa` 漏配一律拒绝执行,
   **绝不取一个指向生产的默认值**
-- **可替换** — provider (飞书/钉钉/Slack) + deployer (github/kubectl/helm) 抽象层就位
+- **可替换** — provider (飞书 ✅ / Slack ✅ / 钉钉 / 企微) + deployer (github/kubectl/helm) 抽象层就位
 
 ## 架构一览
 
@@ -70,6 +70,16 @@ curl -X POST localhost:8700/release \
 ```
 
 flush 后你会看到审批群里出现"🚀 发版申请·待审批"卡片,通过后触发 dryrun 部署,结果卡回到结果群.
+
+**用 Slack 审批**:按 [docs/SLACK.md](docs/SLACK.md) 建好 Slack App(Socket Mode + 5 个 bot scope),
+在 config.yaml 里加 `slack:` 段(审批频道 ID 等,`feishu:` 段可删),然后:
+
+```bash
+export APPROVAL_PROVIDER=slack SLACK_BOT_TOKEN=xoxb-... SLACK_APP_TOKEN=xapp-...
+python -m app.main        # 不需要任何 FEISHU_* 变量
+```
+
+审批频道里会出现带「批准 / 拒绝」按钮的审批消息;审批人 = 该频道当前成员,默认禁止自批.
 
 完整上手 (含飞书应用申请、审批定义、helm 部署) 见 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
@@ -136,7 +146,8 @@ app/
   main.py / server.py / events.py / settings.py / store.py       核心
   keygrant.py / deploycred.py                                    一次性凭证兑换(取密钥 / 取部署凭据)
   forms.py / cards.py                                            审批表单 + 飞书卡片
-  providers/{feishu,__init__}.py                                 ApprovalProvider ABC + 实现
+  providers/{feishu,__init__}.py                                 ApprovalProvider ABC + 飞书实现
+  providers/slack/{client,messaging,approval,events}.py          Slack 实现(Socket Mode + Block Kit)
   deployers/{github,kubectl,helm,dryrun,__init__}.py             Deployer ABC + 实现
   sources/{github,__init__}.py                                   ChangelogSource ABC + 实现
   feishu.py / github.py / deployer.py                            (legacy modules,被 abstraction 层 wrap)
@@ -159,7 +170,8 @@ scripts/
 - [Getting Started](docs/GETTING_STARTED.md) — 从零到跑通
 - [Architecture](docs/ARCHITECTURE.md) — 长连接 / CAS / dispatch 编排
 - [Configuration](docs/CONFIGURATION.md) — config.yaml 全字段
-- [Providers](docs/PROVIDERS.md) — 新增审批平台适配器
+- [Providers](docs/PROVIDERS.md) — 审批平台适配器(飞书 / Slack)与新增步骤
+- [Slack](docs/SLACK.md) — 创建 Slack App、审批规则、自批策略
 - [Deployers](docs/DEPLOYERS.md) — 新增部署执行器
 - [Security](docs/SECURITY.md) — 威胁模型与已知边界
 - [Contributing](CONTRIBUTING.md) — PR / Issue 规范
