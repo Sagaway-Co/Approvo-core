@@ -9,12 +9,15 @@ workflow_dispatch 的 token(env GITHUB_TOKEN),不持有任何 kubeconfig。
 import os
 import re
 import time
+from datetime import UTC, datetime
 
 import requests
 
 from app import deploycred, k8s
 
 API = os.environ.get("GITHUB_API", "https://api.github.com")  # 自建/企业版改这里
+# 没签发部署凭据兑换券时,run 最多排队多少分钟(签发了就按券的有效期)
+QUEUE_MAX_MIN = int(os.environ.get("GITHUB_QUEUE_MAX_MIN", "30"))
 
 # 安装 token 缓存(GitHub App 方式,token ~1h 过期,提前续)
 # 按 target_repo 分开缓存 - 每个受限发版仓拿自己 scope 的 token,
@@ -278,10 +281,14 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
     #    让流水线明确失败(强制动态凭据 = 没有凭据就不部署),
     #    而不是让它悄悄回落到 runner 上的文件。
     cred_target = k8s.deploy_target_allowed(env_cluster(spec, env), _deploy_ns(spec, env))
+    # 排队上限:run 超过这么久还没开始执行就取消。有兑换券时 = 券的有效期(过期后开始了也拿不到凭据,
+    # 只会失败;而且晚到的部署可能和之后的发版交错,不如明确取消、让人重新发起)。
+    queue_max = QUEUE_MAX_MIN * 60
     if cred_target:
         grant, ttl = deploycred.issue_grant(spec.get("instance_code", "-"),
                                             cred_target["cluster"], cred_target["namespace"])
         inputs["cred_grant"] = grant
+        queue_max = ttl * 60
         print(f"[github] 已签发部署凭据兑换券 target={cred_target['cluster']}/"
               f"{cred_target['namespace']} ttl={ttl}m")
     else:
@@ -289,6 +296,21 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
               "(流水线将因缺少动态凭据而失败 —— 这是刻意的 fail-close)")
 
     inputs.update(g.get("inputs", {}))
+
+    # 按 deploy.yml 的 run-name 定位 run(run-name = "deploy <app> <tag> (<env>)")。
+    # 🔴 派发前先记下【已有的】同名 run,之后只认新出现的那个:同一 tag 重发时旧 run 也同名,
+    #    只按名字匹配会把上一次的结论当成这一次的。记不下来就退回按创建时间判断。
+    title = f"deploy {spec['repo']} {spec['tag']} ({env})"
+    page = f"https://github.com/{owner}/{repo}/actions/workflows/{workflow}"
+    runs_url = f"{API}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs"
+    runs_params = {"event": "workflow_dispatch", "per_page": 20}
+    try:
+        known = {run.get("id") for run in _get_json(runs_url, repo, params=runs_params).get("workflow_runs", [])
+                 if _run_titled(run, title)}
+    except Exception as e:  # 只是为了排除旧 run;查不到就改用创建时间,不影响派发
+        known = None
+        print(f"[github] 派发前查询已有 run 失败(改按创建时间定位): {type(e).__name__}: {e}")
+    t0 = time.time()
 
     # 派发重试:只在【连接层】失败时重试(ConnectionError 含 SSLError/ConnectTimeout,
     # 说明连接就没建起来、请求未送达 → 重试安全)。
@@ -312,46 +334,138 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
     if r.status_code != 204:
         return False, f"workflow_dispatch 失败 HTTP {r.status_code}: {r.text}"
 
-    # 按 deploy.yml 的 run-name 定位刚触发的 run(run-name = "deploy <app> <tag> (<env>)")
-    title = f"deploy {spec['repo']} {spec['tag']} ({env})"
-    page = f"https://github.com/{owner}/{repo}/actions/workflows/{workflow}"
+    # 🔴 2026-11-16:GitHub 侧故障,run 建出来后 44 分钟才开始执行。原实现只找 60 秒,
+    #    找不到就返回【成功】→ 审批卡显示"已部署",实际什么都没做;run 后来开始时兑换券已过期,
+    #    在迁移前就失败了,没人知道。现在:找到排队上限为止;仍找不到 = 结果未知,按失败报,绝不判成功。
     run_id, url = None, page
-    for _ in range(20):
-        time.sleep(3)
-        rr = requests.get(f"{API}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs",
-                          headers=_headers(repo), params={"event": "workflow_dispatch", "per_page": 20}, timeout=10)
-        for run in rr.json().get("workflow_runs", []):
-            if run.get("display_title") == title or run.get("name") == title:
+    while run_id is None and time.time() - t0 < queue_max:
+        time.sleep(3 if time.time() - t0 < 60 else 15)
+        try:
+            rr = _get_json(runs_url, repo, params=runs_params)
+        except Exception as e:  # 查询是幂等的读:抖动就下一轮再查,不能因此判部署失败
+            print(f"[github] 定位 run 时查询失败(稍后重试): {type(e).__name__}: {e}")
+            continue
+        for run in rr.get("workflow_runs", []):
+            if _run_titled(run, title) and _run_is_new(run, known, t0):
                 run_id, url = run["id"], run["html_url"]
                 break
-        if run_id:
-            break
     if not run_id:
-        return True, f"已触发,但没定位到 run(去 Actions 查看):{page}"
+        return False, (f"已派发,但 {queue_max // 60} 分钟内没在 GitHub 找到对应的 run,部署结果未知"
+                       f"(不按成功处理):请到 Actions 核对 {page}")
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        d = requests.get(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}",
-                         headers=_headers(repo), timeout=10).json()
-        if d.get("status") == "completed":
+    # 两段计时:排队(没开始执行)最多 queue_max,超过就取消;开始执行后再算 timeout。
+    # 排队时间不能吃掉执行时间,否则 GitHub 一慢,正在正常部署的 run 也会被判超时。
+    started_at = None
+    while started_at is None or time.time() - started_at < timeout:
+        # 🔴 2026-11-11:轮询时 api.github.com 一次 10s 读超时,异常直接冒出来,
+        #    审批卡把"GitHub 超时"当成部署失败原因,真实原因(部署侧清单校验)反而看不到。
+        #    轮询只是幂等的读:失败就记一笔、等下一轮,直到 deadline;部署本身不受影响。
+        try:
+            d = _get_json(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}", repo)
+        except Exception as e:
+            print(f"[github] 轮询 run {run_id} 失败(稍后重试): {type(e).__name__}: {e}")
+            if started_at is None and time.time() - t0 >= queue_max:
+                started_at = time.time()   # 一直查不到状态:不能无限等,按已开始计执行超时
+            time.sleep(8)
+            continue
+        status = d.get("status")
+        if started_at is None and status not in _RUN_NOT_STARTED and status != "completed":
+            started_at = time.time()
+            print(f"[github] run {run_id} 开始执行(排队 {int(started_at - t0)}s)")
+        elif started_at is None and status in _RUN_NOT_STARTED and time.time() - t0 >= queue_max:
+            cancelled = _cancel_run(owner, repo, run_id)
+            print(f"[github] run {run_id} 排队超过 {queue_max // 60} 分钟仍未开始,"
+                  f"{'已取消' if cancelled else '取消失败'}")
+            return False, (f"GitHub 排队 {queue_max // 60} 分钟仍未开始执行(部署凭据兑换券已到期,"
+                           f"开始了也拿不到凭据),"
+                           f"{'已取消该 run' if cancelled else '取消该 run 失败,请手动取消'};"
+                           f"确认 GitHub 恢复后重新发起:{url}")
+        if status == "completed":
             concl = d.get("conclusion")
             if concl == "success":
                 return True, f"GitHub run {url} -> success"
             # 失败:列出失败的 step + run 链接(点进去看完整日志:拉不到镜像/健康检查等)
-            fails = []
+            fails, errors = [], []
             try:
-                jr = requests.get(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
-                                  headers=_headers(repo), timeout=10).json()
+                jr = _get_json(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs", repo)
                 for j in jr.get("jobs", []):
                     for st in j.get("steps", []) or []:
                         if st.get("conclusion") == "failure":
                             fails.append(f"{j.get('name')} / {st.get('name')}")
-            except Exception:
-                pass
+                    if j.get("conclusion") == "failure" and j.get("id"):
+                        errors += _job_error_lines(owner, repo, j["id"])
+            except Exception as e:
+                print(f"[github] 取失败详情失败(不影响结论): {type(e).__name__}: {e}")
             detail = ("失败步骤: " + "; ".join(fails) + "\n") if fails else ""
+            if errors:
+                detail += "失败原因:\n" + "\n".join(errors[-8:]) + "\n"
             return False, f"GitHub run -> {concl}\n{detail}完整日志: {url}"
         time.sleep(8)
     return False, f"GitHub run 超时未完成:{url}"
+
+
+# run 还没开始执行的状态(GitHub Actions 的 run.status)
+_RUN_NOT_STARTED = {"queued", "pending", "waiting", "requested"}
+
+
+def _run_titled(run: dict, title: str) -> bool:
+    return run.get("display_title") == title or run.get("name") == title
+
+
+def _run_is_new(run: dict, known: set | None, t0: float) -> bool:
+    """派发后新出现的 run:派发前记下了已有 id 就按 id 排除;没记下就按创建时间(容 2 分钟时钟偏差)。"""
+    if known is not None:
+        return run.get("id") not in known
+    try:
+        created = datetime.strptime(run.get("created_at") or "", "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return created.replace(tzinfo=UTC).timestamp() >= t0 - 120
+
+
+def _cancel_run(owner: str, repo: str, run_id) -> bool:
+    try:
+        r = requests.post(f"{API}/repos/{owner}/{repo}/actions/runs/{run_id}/cancel",
+                          headers=_headers(repo), timeout=15)
+        return r.status_code in (202, 204)
+    except requests.exceptions.RequestException as e:
+        print(f"[github] 取消 run {run_id} 失败: {type(e).__name__}: {e}")
+        return False
+
+
+def _get_json(url: str, repo: str, params: dict | None = None, tries: int = 4) -> dict:
+    """幂等的 GitHub 读请求:连接失败 / 读超时 / 5xx 退避重试;最后一次仍失败就抛出,由调用方决定怎么办。"""
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=_headers(repo), params=params, timeout=15)
+            if r.status_code >= 500:
+                raise requests.exceptions.HTTPError(f"HTTP {r.status_code}")
+            return r.json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                requests.exceptions.HTTPError, ValueError):
+            if i == tries - 1:
+                raise
+            time.sleep(3 * (i + 1))
+    return {}
+
+
+_ERR_LINE = re.compile(r"(?:##\[error\]|::error::)\s*(.*)")
+_TS_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z\s?")
+
+
+def _job_error_lines(owner: str, repo: str, job_id: int, limit: int = 8) -> list:
+    """失败 job 日志里的 ##[error] / ::error:: 行(部署脚本把失败原因写成这种行),原样带回审批卡。
+    🔴 只取错误行、截断长度:日志由部署脚本控制且已遮蔽凭据,但卡片仍只放必要信息。"""
+    r = requests.get(f"{API}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+                     headers=_headers(repo), timeout=20)
+    if r.status_code != 200:
+        return []
+    out = []
+    for ln in r.text.splitlines():
+        m = _ERR_LINE.search(_TS_PREFIX.sub("", ln))
+        if m and m.group(1).strip() and "Process completed with exit code" not in m.group(1):
+            out.append(m.group(1).strip()[:300])
+    return out[-limit:]
 
 
 # ---------- check-prereq：release 必须是同号 pre 的 promote ----------

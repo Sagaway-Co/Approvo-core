@@ -59,8 +59,10 @@ def _run_deploy(instance_code: str, spec: dict, approver_name):
     failed 并告警,让它可见、可重发。
     """
     _safe_card(cards.deploying_card(spec, approver_name=approver_name, when=_now()), "部署中")
+    # 审批单号随部署走(兑换券 → 部署流水线,流水线可凭它回溯到这张审批);原来 spec 里没有它,只能拿到 "-"
+    deploy_spec = spec if spec.get("instance_code") else dict(spec, instance_code=instance_code)
     try:
-        ok, log = get_deployer(spec.get("method", "kubectl")).deploy(spec)
+        ok, log = get_deployer(spec.get("method", "kubectl")).deploy(deploy_spec)
     except Exception as e:  # 兜底:部署器任何异常都要可见(BLE001 已在 ruff.toml 全局 ignore)
         ok, log = False, f"部署异常({type(e).__name__}): {e}"
         traceback.print_exc()
