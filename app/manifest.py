@@ -27,6 +27,8 @@
       - name: svc-a-secrets
         keys:
           API_KEY: {sha256: "0123456789ab", sealed: "<base64 密文>"}
+    workers:                           # 可选;要部署的边缘函数构建包(如 Cloudflare Worker):名字、构建 tag、包的 sha256
+      - {name: edge-app, tag: v1.2.0, sha256: "<64 位十六进制>"}
     notes: 一句话说明                   # 可选
 
 登记表(可选):`services.<name>.image` 与 `services.<name>.deploy[].deployment`。
@@ -49,6 +51,7 @@ MAX_MIGRATIONS = 50
 MAX_CONFIGMAPS = 50
 MAX_SECRETS = 20
 MAX_SECRET_KEYS = 50
+MAX_WORKERS = 10
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 _IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,199}")
@@ -57,6 +60,7 @@ _PATH_SEG_RE = re.compile(r"[A-Za-z0-9._-]{1,200}")
 _SECRET_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 _SECRET_KEY_RE = re.compile(r"[-._A-Za-z0-9]{1,253}")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8,64}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class ManifestError(ValueError):
@@ -133,11 +137,33 @@ def parse_manifest(text: str) -> dict:
     deployments = [safe_rel_path(d, "Deployment 清单路径")
                    for d in _list(data, "deployments", MAX_CONFIGMAPS)]
     secrets = _secrets(data)
+    workers = _workers(data)
     notes = data.get("notes")
     if notes is not None and not isinstance(notes, (str, int, float)):
         raise ManifestError("清单的 notes 必须是一行文本")
     return {"services": services, "migrations": migrations, "configmaps": configmaps,
-            "deployments": deployments, "secrets": secrets, "notes": "" if notes is None else str(notes).strip()}
+            "deployments": deployments, "secrets": secrets, "workers": workers,
+            "notes": "" if notes is None else str(notes).strip()}
+
+
+def _workers(data: dict) -> list:
+    """可选的 workers:要部署的边缘函数构建包。卡片上放名字、构建 tag 与 sha256(审批人核对的是这份包)。"""
+    out, seen = [], set()
+    for w in _list(data, "workers", MAX_WORKERS):
+        if not isinstance(w, dict) or set(w) != {"name", "tag", "sha256"}:
+            raise ManifestError(f"清单 workers 每项只能有 name / tag / sha256:{w!r}"[:300])
+        name, tag, sha = w.get("name"), w.get("tag"), w.get("sha256")
+        if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+            raise ManifestError(f"清单 workers 里有不合法的名字:{name!r}")
+        if name in seen:
+            raise ManifestError(f"清单 workers 里 {name} 重复")
+        seen.add(name)
+        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+            raise ManifestError(f"清单 workers 的 {name}:tag 不合法:{tag!r}")
+        if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
+            raise ManifestError(f"清单 workers 的 {name}:sha256 必须是 64 位十六进制")
+        out.append({"name": name, "tag": tag, "sha256": sha})
+    return out
 
 
 def _secrets(data: dict) -> list:

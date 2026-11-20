@@ -223,6 +223,11 @@ def _manifest(spec: dict) -> str | None:
         for sc in secs[:10]:
             ks = "、".join(f"{_code(k.get('name'))} 指纹 {_code(k.get('sha256'))}" for k in (sc.get("keys") or [])[:15])
             lines.append(f"· *{esc(sc.get('name'))}*:{ks}")
+    wks = m.get("workers") or []
+    if wks:
+        lines.append(f"*☁️ 边缘函数部署({len(wks)},核对构建 tag 与包的 sha256)*")
+        for w in wks[:10]:
+            lines.append(f"· *{esc(w.get('name'))}* ← {_code(w.get('tag'))} sha256 {_code(str(w.get('sha256'))[:12])}")
     if m.get("notes"):
         lines.append(f"*说明*:{esc(_clip(str(m['notes']), 300))}")
     return "\n".join(lines)

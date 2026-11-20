@@ -168,6 +168,11 @@ def _manifest_block(spec: dict) -> dict | None:
         for sc in secs[:10]:
             ks = "、".join(f"`{_md_safe(k.get('name'))}` 指纹 `{_md_safe(k.get('sha256'))}`" for k in (sc.get("keys") or [])[:15])
             lines.append(f"· **{_md_safe(sc.get('name'))}**:{ks}")
+    wks = m.get("workers") or []
+    if wks:
+        lines.append(f"**☁️ 边缘函数部署({len(wks)},核对构建 tag 与包的 sha256)**")
+        for w in wks[:10]:
+            lines.append(f"· **{_md_safe(w.get('name'))}** ← `{_md_safe(w.get('tag'))}` sha256 `{_md_safe(str(w.get('sha256'))[:12])}`")
     if m.get("notes"):
         lines.append(f"**说明**:{_md_safe(str(m['notes']))[:300]}")
     return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}

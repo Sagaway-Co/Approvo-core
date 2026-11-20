@@ -286,3 +286,26 @@ def test_server_collect_uses_source_repo_and_git_tag(monkeypatch):
     rel["release_manifest"]["optional"] = "yes"
     server._collect_manifest(rel, req)
     assert got["optional"] is False
+
+
+def test_workers_are_listed_with_tag_and_digest():
+    """workers 把名字、构建 tag、sha256 前 12 位放上卡;格式不对 fail-close。"""
+    from app import cards, manifest
+    sha = "ab" * 32
+    m = manifest.parse_manifest(MANIFEST + f"workers:\n  - {{name: edge-app, tag: v1.2.0, sha256: \"{sha}\"}}\n")
+    assert m["workers"] == [{"name": "edge-app", "tag": "v1.2.0", "sha256": sha}]
+    spec = {"repo": "r", "tag": TAG, "image": "x", "submit_time": "-",
+            "manifest": dict(m, status="ok", path="r/x.yaml", commit=SHA,
+                             services=[{"name": n, "image": None, "deployments": []} for n in m["services"]])}
+    for dump in (json.dumps(messaging.approval_message("slk-x", spec)[1], ensure_ascii=False),
+                 json.dumps(cards._manifest_block(spec), ensure_ascii=False)):
+        assert "edge-app" in dump and "v1.2.0" in dump and sha[:12] in dump
+    assert manifest.parse_manifest("services: []\n")["workers"] == []
+    for bad, why in [("workers: x", "必须是列表"),
+                     ("workers:\n  - {name: a, tag: v1}", "只能有 name / tag / sha256"),
+                     (f"workers:\n  - {{name: '-a', tag: v1, sha256: \"{sha}\"}}", "不合法的名字"),
+                     (f"workers:\n  - {{name: a, tag: '../x', sha256: \"{sha}\"}}", "tag 不合法"),
+                     ("workers:\n  - {name: a, tag: v1, sha256: \"abc\"}", "64 位十六进制"),
+                     (f"workers:\n  - {{name: a, tag: v1, sha256: \"{sha}\"}}\n  - {{name: a, tag: v2, sha256: \"{sha}\"}}", "重复")]:
+        with pytest.raises(manifest.ManifestError, match=why):
+            manifest.parse_manifest("services: []\n" + bad + "\n")
