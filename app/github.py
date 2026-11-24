@@ -15,6 +15,7 @@ from urllib.parse import quote
 import requests
 
 from app import deploycred, k8s, manifest
+from app import rollback as _rollback
 
 API = os.environ.get("GITHUB_API", "https://api.github.com")  # 自建/企业版改这里
 # 没签发部署凭据兑换券时,run 最多排队多少分钟(签发了就按券的有效期)
@@ -272,6 +273,9 @@ def dispatch_and_wait(spec: dict, timeout: int = 900):
         return False, ("github.env 未配置,拒绝派发(刻意不默认 prod —— "
                        "缺省值指向生产是这类设计最常见的致命错误)")
     inputs = {"app": spec["repo"], "tag": spec["tag"], "env": env}
+    # 回滚：把清单以 JSON 随派发交给部署 workflow（它按 rollback_spec 走回滚分支，不构建、不跑迁移）
+    if spec.get("rollback"):
+        inputs["rollback_spec"] = _rollback.dispatch_input(spec["rollback"])
 
     # 部署凭据的一次性兑换券。流水线用它 + RELEASE_TOKEN 换 10 分钟绑定 token,
     # 部署完回调撤销 —— 取代常驻 runner 的长期 kubeconfig(见 app/deploycred.py)。

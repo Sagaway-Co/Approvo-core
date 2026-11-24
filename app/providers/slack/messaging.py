@@ -233,8 +233,22 @@ def _manifest(spec: dict) -> str | None:
     return "\n".join(lines)
 
 
+def _rollback(spec: dict) -> str | None:
+    """回滚请求区块（语义同 cards._rollback_block）。"""
+    rb = spec.get("rollback")
+    if not rb:
+        return None
+    from app import rollback as _rb
+    lines = ["*↩️ 回滚（切回历史版本镜像，不跑迁移）*"]
+    lines += [f"· {esc(x)}" for x in _rb.summary_lines(rb)]
+    return _clip("\n".join(lines), 3000)
+
+
 def _what(spec: dict) -> list:
     """「发什么」区块组:有清单 → 清单(另有 notes 时附环境变更);没有 → 旧的镜像 + 环境变更。"""
+    rb = _rollback(spec)
+    if rb:
+        return [_section(rb)]
     man = _manifest(spec)
     if man:
         out = [_section(man)]

@@ -178,8 +178,22 @@ def _manifest_block(spec: dict) -> dict | None:
     return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}
 
 
+def _rollback_block(spec: dict):
+    """回滚请求区块：切回哪些服务的哪个版本、是否动 ConfigMap、是否允许跨迁移。"""
+    rb = spec.get("rollback")
+    if not rb:
+        return None
+    from app import rollback as _rollback
+    lines = ["**↩️ 回滚（切回历史版本镜像，不跑迁移）**"]
+    lines += [f"· {_md_safe(x)}" for x in _rollback.summary_lines(rb)]
+    return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:3000]}}
+
+
 def _what_blocks(spec: dict) -> list:
     """有清单 → 清单(另有 notes 时附环境变更);没有 → 镜像 + 环境变更(原行为)。"""
+    rb_block = _rollback_block(spec)
+    if rb_block:
+        return [rb_block]
     man = _manifest_block(spec)
     if man:
         return [man] + (_env_change_block(spec) if (spec.get("notes") or "").strip() else [])

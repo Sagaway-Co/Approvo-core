@@ -19,6 +19,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
+from app import rollback as _rollback
+
 from app import (
     cards,
     deploycred,
@@ -181,6 +183,7 @@ class ReleaseReq(BaseModel):
     commit: str | None = ""
     notes: str | None = ""
     git_tag: str | None = None           # 真实 git tag；与 tag 不同时必须传，见下
+    rollback: dict | None = None         # 回滚请求，见 app/rollback.py（提供时 tag 必须等于 rollback.id）
     """`git_tag`：仓库里真实的 tag 名，缺省等于 `tag`。
 
     为什么要这个字段：`tag` 承担的是**镜像 tag**（deploy 用它拼
@@ -429,11 +432,19 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
     if stage_override:
         rel = _deep_merge(rel, stage_override)
 
+    # 回滚：切回历史版本的镜像，不发新版本（无 tag 比较、无清单、无变更对比），仍走同一套审批。
+    rb = None
+    if req.rollback is not None:
+        try:
+            rb = _rollback.validate(req.rollback, req.tag)
+        except _rollback.RollbackError as e:
+            raise HTTPException(400, f"回滚请求不合法：{e}")
+
     # check-prereq：release 阶段必须是「同号 pre」的 promote（同一 commit 走两道门）。
     # 放在建审批实例【之前】——不合契约的发版根本不该惊动审批人。
     # fail-close：校验本身失败(GitHub 不可达/App 无权限)也不放行。理由同 release.yml 里
     # "approvo 不可达就 fail、绝不 || true 绕过"——门禁失灵时默认拒绝，而不是默认放行。
-    if (req.stage or "") == "release":
+    if (req.stage or "") == "release" and rb is None:
         try:
             # 用 git_tag（真实 tag）而不是 tag（镜像 tag）：两者可能不同，
             # 见 ReleaseReq.git_tag 的说明。缺省回落 tag，行为与从前一致。
@@ -450,7 +461,7 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
             raise HTTPException(409, f"check-prereq 未通过：{_why}")
 
     # 发布清单在建审批实例【之前】读:读不到就不惊动审批人(同 check-prereq 的 fail-close)
-    release_manifest = _collect_manifest(rel, req)
+    release_manifest = None if rb else _collect_manifest(rel, req)
 
     image = f"{rel['image_repo']}:{req.tag}" if rel.get("image_repo") else req.tag
     method = rel.get("method", "kubectl")
@@ -518,9 +529,10 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
         #    而另一个项目当时没暴露,因为它命中了"按项目名猜命名空间"的兜底 ——
         #    "有一条路能走通"掩盖了"另一条路根本没接上"(兜底已一并移除)。
         "deploy": rel.get("deploy"),
-        "changes": _collect_changes(rel, req, head_commit),
-        "db_changes": _collect_db_changes(rel, req),
+        "changes": None if rb else _collect_changes(rel, req, head_commit),
+        "db_changes": None if rb else _collect_db_changes(rel, req),
         "manifest": release_manifest,
+        "rollback": rb,
     }
     if settings.APPROVAL_PROVIDER == "slack":
         # 自批判定的依据随记录落库:点击可能发生在几小时后、甚至重启之后

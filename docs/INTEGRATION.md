@@ -160,3 +160,26 @@ CrashLoopBackOff 反复重启容器，读到的还是同一份旧值。
 | 镜像版本 | 重新发一个旧 tag（不要删 tag —— 删 tag 不释放版本号，会造成"同号不同码"） |
 | 配置 | 用旧 commit 重新 apply |
 | 密钥 | 换之前先把现值备份到 600 文件；换完留一个可回退窗口再销毁旧值 |
+
+## 回滚请求（rollback）
+
+`POST /release` 的请求体可带 `rollback` 字段，用于把指定服务切回历史版本的镜像。它与发版共用同一套审批与派发流程。
+
+```json
+{
+  "repo": "my-app",
+  "tag": "RB-svc-1",
+  "rollback": {
+    "id": "RB-svc-1",
+    "services": {"my-app": "v1.2.1"},
+    "configmaps": [],
+    "allow_schema_behind": false,
+    "notes": "回退 v1.2.2 的线上问题"
+  }
+}
+```
+
+- `tag` 必须等于 `rollback.id`（格式 `RB-xxx`）。
+- 不做 tag 比较、不读发布清单、不做变更对比；审批卡显示切回的服务与目标版本、是否改 ConfigMap、是否允许跨迁移。
+- 审批通过后，派发给部署 workflow 的 `rollback_spec` 输入是规范化后的 JSON。部署 workflow 需要声明该输入；否则派发会失败。
+- 目标版本是否存在、是否早于最新版、目标之后的版本是否含迁移，都由部署侧检查（fail-close），Approvo 只校验结构。
