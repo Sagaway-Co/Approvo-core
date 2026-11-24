@@ -19,8 +19,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from app import rollback as _rollback
-
 from app import (
     cards,
     deploycred,
@@ -30,6 +28,7 @@ from app import (
     k8s,
     keygrant,
     manifest,
+    rollback,
     settings,
     store,
     wshealth,
@@ -436,8 +435,8 @@ def release(req: ReleaseReq, x_release_token: str = Header(default="")):
     rb = None
     if req.rollback is not None:
         try:
-            rb = _rollback.validate(req.rollback, req.tag)
-        except _rollback.RollbackError as e:
+            rb = rollback.validate(req.rollback, req.tag)
+        except rollback.RollbackError as e:
             raise HTTPException(400, f"回滚请求不合法：{e}")
 
     # check-prereq：release 阶段必须是「同号 pre」的 promote（同一 commit 走两道门）。
